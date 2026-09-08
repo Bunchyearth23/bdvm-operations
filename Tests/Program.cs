@@ -64,9 +64,10 @@ internal static class Program
         state.IndustrialRecipes.Add(new IndustrialRecipe { RecipeId = "mill", FacilityId = "MILL", InputCargoId = "Logs", InputQuantity = 2m, OutputCargoId = "Lumber", OutputQuantity = 1m, CadenceTicks = 10, MaximumBacklogCycles = 3 });
         var engine = Engine(state);
         var blocked = engine.AdvanceProduction("tick-30", "mill", 30);
-        state.IndustrialStocks.Single(x => x.CargoId == "Lumber").OnHand = 0m;
-        var resumed = engine.AdvanceProduction("tick-30-resume", "mill", 30);
-        var recipe = state.IndustrialRecipes.Single();
+        var restored = VehicleAcquisitionPersistence.Deserialize(VehicleAcquisitionPersistence.Serialize(state), state.CheckpointId);
+        restored.IndustrialStocks.Single(x => x.CargoId == "Lumber").OnHand = 0m;
+        var resumed = Engine(restored).AdvanceProduction("tick-30-resume", "mill", 30);
+        var recipe = restored.IndustrialRecipes.Single();
         Check(blocked == 0 && resumed == 2 && recipe.PendingCycles == 1 && recipe.CompletedCycles == 2, "output saturation applies backpressure and resumes persisted bounded backlog after delivery");
     }
 
