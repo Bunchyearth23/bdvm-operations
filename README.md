@@ -16,7 +16,9 @@
 
 - Reserve, activate, complete or cancel freight and passenger mission assignments.
 - Keep mission completion behind a port so a game adapter can validate the real-world result.
-- Model station inventories, production recipes, industrial contracts and delivery-pending states.
+- Model persistent station inventories, bounded production backlogs, preparation reservations and versioned transport contracts.
+- Require compatible rolling stock owned or actively leased by the operator; contracts never supply or replace wagons.
+- Reconcile partial loading and unloading through per-wagon manifests and idempotency keys, then pay cumulative recognized delivery exactly once.
 - Prevent competing generators from producing contradictory jobs or free rolling stock when an integration can control them.
 - Record fuel, maintenance, access and other operating costs against the correct personal or company account.
 - Track external settlement conflicts instead of silently charging twice.
@@ -24,7 +26,9 @@
 
 ## Key surfaces
 
-The main services are `MissionAssignmentEngine`, `IndustrialEconomyEngine`, `OperatingCostEngine` and `TriageAssistanceEngine`. Integration points include `IMissionCompletionPort`, `IIndustrialExecutionPort`, `ICompetingGeneratorControl` and `ITriageLogisticsPort`.
+The main services are `MissionAssignmentEngine`, `IndustrialEconomyEngine`, `OperatingCostEngine` and `TriageAssistanceEngine`. Integration points include `IMissionCompletionPort`, `IIndustrialExecutionPort`, `ICargoTransferObservationPort`, `IWagonCompatibilityPort`, `ITransportGeneratorAdapter` and `ITriageLogisticsPort`.
+
+`TransportContract` schema 2 contains cargo, quantity, origin, destination, deadline, reward and wagon requirements. `AssignedWagons` records an operator choice after acceptance; it is not supplied equipment. Acceptance reserves source cargo and destination capacity for a bounded preparation window. Expiry or cancellation releases those reservations idempotently. Loading removes only observed cargo from source stock; unloading credits destination stock and reward only for the observed delta.
 
 ## Boundaries
 
@@ -52,7 +56,9 @@ Domain validation covers assignment lifecycles, industrial stock conservation, g
 
 ## Compatibility
 
-Job and contract IDs are stable persisted references. Completion, cancellation and external settlement must be idempotent. Missing generator-control integrations fail closed where duplicate world generation would damage the economy.
+Job and contract IDs are stable persisted references. Completion, cancellation and external settlement must be idempotent. Missing generator-control integrations fail closed where duplicate world generation would damage the economy. Strict activation rolls back already-suspended generators if any required control fails, and existing open jobs remain readable through the adapter instead of being deleted.
+
+The audited runtime surfaces and remaining Unity validations are listed in [INTEGRATION_SURFACES.md](INTEGRATION_SURFACES.md).
 
 ## License
 

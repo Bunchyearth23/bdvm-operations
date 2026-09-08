@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\BDVM.Core\Domain\*.cs" Link="Domain\Core\%(Filename)%(Extension)" />
+    <Compile Include="..\..\BDVM.Companies\Domain\*.cs" Link="Domain\Companies\%(Filename)%(Extension)" />
+    <Compile Include="..\..\BDVM.Fleet\Domain\*.cs" Link="Domain\Fleet\%(Filename)%(Extension)" />
+    <Compile Include="..\..\BDVM.Market\Domain\*.cs" Link="Domain\Market\%(Filename)%(Extension)" />
+    <Compile Include="..\Domain\*.cs" Link="Domain\Operations\%(Filename)%(Extension)" />
+    <Compile Include="..\..\BDVM.Passengers\Domain\*.cs" Link="Domain\Passengers\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
