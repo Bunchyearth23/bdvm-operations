@@ -127,6 +127,13 @@ public interface ITransportGeneratorAdapter
     IReadOnlyList<string> ReadExistingOpenJobIds();
 }
 
+public sealed class StrictGeneratorActivationReport
+{
+    public bool Applied { get; set; }
+    public string ResultCode { get; set; } = "strict-generator-not-applied";
+    public IReadOnlyList<string> PreservedOpenJobIds { get; set; } = Array.Empty<string>();
+}
+
 public sealed class DisabledIndustrialExecutionPort : IIndustrialExecutionPort
 {
     public bool Available => false;
@@ -144,18 +151,61 @@ public static class IndustrialRuntimeGate
         => execution != null && execution.Available && generator != null && generator.CanSuspendNewGeneration && generator.TrySuspendNewGeneration(operationId);
 
     public static bool TryEnableStrict(string operationId, IEnumerable<ITransportGeneratorAdapter> generators)
+        => TryEnableStrictWithReport(operationId, generators).Applied;
+
+    public static StrictGeneratorActivationReport TryEnableStrictWithReport(string operationId, IEnumerable<ITransportGeneratorAdapter> generators)
     {
         var controls = (generators ?? Array.Empty<ITransportGeneratorAdapter>()).ToArray();
-        if (controls.Length == 0 || controls.Any(x => x == null || !x.CanSuppressNewConsists)) return false;
+        if (string.IsNullOrWhiteSpace(operationId) || controls.Length == 0 || controls.Any(x => x == null || string.IsNullOrWhiteSpace(x.GeneratorId) || !x.CanSuppressNewConsists) || controls.GroupBy(x => x.GeneratorId, StringComparer.Ordinal).Any(x => x.Count() != 1))
+            return Report(false, "strict-generator-control-unavailable", Array.Empty<string>());
+        IReadOnlyList<string>[] before;
+        try { before = controls.Select(ReadStableOpenJobs).ToArray(); }
+        catch { return Report(false, "strict-existing-jobs-unreadable", Array.Empty<string>()); }
         var changed = new List<ITransportGeneratorAdapter>();
-        foreach (var control in controls)
+        for (var index = 0; index < controls.Length; index++)
         {
-            if (control.TrySetNewConsistsSuppressed(operationId + ":" + control.GeneratorId, true)) { changed.Add(control); continue; }
-            foreach (var rollback in changed.AsEnumerable().Reverse()) rollback.TrySetNewConsistsSuppressed(operationId + ":rollback:" + rollback.GeneratorId, false);
-            return false;
+            var control = controls[index];
+            var applied = false;
+            try { applied = control.TrySetNewConsistsSuppressed(operationId + ":" + control.GeneratorId, true); }
+            catch { applied = false; }
+            if (applied) { changed.Add(control); continue; }
+            RollBack(operationId, changed);
+            return Report(false, "strict-generator-suspension-failed:" + control.GeneratorId, Array.Empty<string>());
         }
-        return true;
+        try
+        {
+            var after = controls.Select(ReadStableOpenJobs).ToArray();
+            for (var index = 0; index < controls.Length; index++)
+                if (before[index].Except(after[index], StringComparer.Ordinal).Any())
+                {
+                    RollBack(operationId, changed);
+                    return Report(false, "strict-existing-jobs-mutated:" + controls[index].GeneratorId, Array.Empty<string>());
+                }
+            return Report(true, "strict-generator-control-active", before.SelectMany(x => x).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToArray());
+        }
+        catch
+        {
+            RollBack(operationId, changed);
+            return Report(false, "strict-existing-jobs-unreadable-after-suspension", Array.Empty<string>());
+        }
     }
+
+    private static IReadOnlyList<string> ReadStableOpenJobs(ITransportGeneratorAdapter control)
+    {
+        var ids = control.ReadExistingOpenJobIds() ?? throw new InvalidOperationException("Generator returned no migration inventory.");
+        if (ids.Any(string.IsNullOrWhiteSpace) || ids.Distinct(StringComparer.Ordinal).Count() != ids.Count) throw new InvalidOperationException("Generator returned an invalid migration inventory.");
+        return ids.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+    }
+
+    private static void RollBack(string operationId, IEnumerable<ITransportGeneratorAdapter> changed)
+    {
+        foreach (var rollback in changed.Reverse())
+            try { rollback.TrySetNewConsistsSuppressed(operationId + ":rollback:" + rollback.GeneratorId, false); }
+            catch { /* Best-effort rollback; the caller still receives a fail-closed result. */ }
+    }
+
+    private static StrictGeneratorActivationReport Report(bool applied, string code, IReadOnlyList<string> jobs) =>
+        new StrictGeneratorActivationReport { Applied = applied, ResultCode = code, PreservedOpenJobIds = jobs };
 }
 
 public sealed class IndustrialEconomyEngine

@@ -14,6 +14,9 @@ internal static class Program
         LeasedWagonExpiryAndMissingWagonFailClosed();
         ProductionBackpressureRetainsBoundedBacklog();
         StrictGeneratorActivationRollsBack();
+        StrictGeneratorActivationPreservesExistingJobs();
+        StrictGeneratorActivationFailsClosedOnMigrationMutation();
+        StrictGeneratorActivationContainsAdapterExceptions();
         Console.WriteLine("W-038 offline checks passed: " + checks);
     }
 
@@ -96,6 +99,29 @@ internal static class Program
         Check(!enabled && !first.Suppressed && first.Calls == 2 && second.Calls == 1, "strict activation fails closed and rolls back controls already changed");
     }
 
+    private static void StrictGeneratorActivationPreservesExistingJobs()
+    {
+        var vanilla = new Generator("vanilla", true, "available-job", "accepted-job");
+        var report = IndustrialRuntimeGate.TryEnableStrictWithReport("strict", new[] { vanilla });
+        Check(report.Applied && report.ResultCode == "strict-generator-control-active" && report.PreservedOpenJobIds.SequenceEqual(new[] { "accepted-job", "available-job" }), "strict activation inventories and preserves jobs opened before migration");
+        Check(vanilla.Suppressed && vanilla.Jobs.SequenceEqual(new[] { "available-job", "accepted-job" }), "strict activation suppresses only new generation and leaves existing jobs cancellable");
+    }
+
+    private static void StrictGeneratorActivationFailsClosedOnMigrationMutation()
+    {
+        var vanilla = new Generator("vanilla", true, "open-job") { RemoveJobsWhenSuppressed = true };
+        var report = IndustrialRuntimeGate.TryEnableStrictWithReport("strict", new[] { vanilla });
+        Check(!report.Applied && report.ResultCode == "strict-existing-jobs-mutated:vanilla" && !vanilla.Suppressed, "strict activation rolls back if a generator removes an existing job during migration");
+    }
+
+    private static void StrictGeneratorActivationContainsAdapterExceptions()
+    {
+        var vanilla = new Generator("vanilla", true, "open-job");
+        var broken = new Generator("broken", true) { ThrowWhenSetting = true };
+        var report = IndustrialRuntimeGate.TryEnableStrictWithReport("strict", new ITransportGeneratorAdapter[] { vanilla, broken });
+        Check(!report.Applied && report.ResultCode == "strict-generator-suspension-failed:broken" && !vanilla.Suppressed, "strict activation contains adapter exceptions and rolls back prior controls");
+    }
+
     private static VehicleAcquisitionSnapshot State(string checkpoint, long balance)
     {
         var economy = new CompanyEconomySnapshot { CheckpointId = checkpoint };
@@ -128,9 +154,10 @@ internal static class Program
     private sealed class Compatibility : IWagonCompatibilityPort { public WagonCompatibility Inspect(string assetId, string definitionId, string cargoId) => new WagonCompatibility { Compatible = definitionId == "wagon.box" && cargoId == "Logs", Capacity = 10m, Detail = "test" }; }
     private sealed class Generator : ITransportGeneratorAdapter
     {
-        private readonly bool succeeds; public Generator(string id, bool succeeds) { GeneratorId = id; this.succeeds = succeeds; }
+        private readonly bool succeeds; public Generator(string id, bool succeeds, params string[] jobs) { GeneratorId = id; this.succeeds = succeeds; Jobs.AddRange(jobs); }
         public string GeneratorId { get; } public bool CanSuppressNewConsists => true; public bool Suppressed { get; private set; } public int Calls { get; private set; }
-        public bool TrySetNewConsistsSuppressed(string operationId, bool suppressed) { Calls++; if (!succeeds) return false; Suppressed = suppressed; return true; }
-        public IReadOnlyList<string> ReadExistingOpenJobIds() => Array.Empty<string>();
+        public List<string> Jobs { get; } = new List<string>(); public bool RemoveJobsWhenSuppressed { get; set; } public bool ThrowWhenSetting { get; set; }
+        public bool TrySetNewConsistsSuppressed(string operationId, bool suppressed) { Calls++; if (ThrowWhenSetting) throw new InvalidOperationException("test adapter failure"); if (!succeeds) return false; Suppressed = suppressed; if (suppressed && RemoveJobsWhenSuppressed) Jobs.Clear(); return true; }
+        public IReadOnlyList<string> ReadExistingOpenJobIds() => Jobs.ToArray();
     }
 }

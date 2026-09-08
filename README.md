@@ -56,7 +56,7 @@ Domain validation covers assignment lifecycles, industrial stock conservation, g
 
 ## Compatibility
 
-Job and contract IDs are stable persisted references. Completion, cancellation and external settlement must be idempotent. Missing generator-control integrations fail closed where duplicate world generation would damage the economy. Strict activation rolls back already-suspended generators if any required control fails, and existing open jobs remain readable through the adapter instead of being deleted.
+Job and contract IDs are stable persisted references. Completion, cancellation and external settlement must be idempotent. Missing generator-control integrations fail closed where duplicate world generation would damage the economy. Strict activation inventories open jobs before and after suppressing new generation, rolls back already-suspended generators if any required control fails or removes a migrated job, and reports the preserved IDs. The Full vanilla adapter leaves those jobs registered in `JobsManager`, while packaging audits that the vanilla `AbandonJob(Job)` surface still exists.
 
 The audited runtime surfaces and remaining Unity validations are listed in [INTEGRATION_SURFACES.md](INTEGRATION_SURFACES.md).
 
