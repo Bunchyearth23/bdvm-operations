@@ -34,6 +34,8 @@ Operations does not drive locomotives. Although the domain enum reserves an `Aut
 
 The project references Common, Companies and Fleet. Passenger demand is supplied by `BDVM.Passengers`; Operations does not depend on it. `Domain/` is currently linked into `BDVM.Full`, so the standalone project compiles only the module marker during migration.
 
+External dependencies: none. SelfShunt, Passenger Jobs and future industrial integrations must be supplied by separate bridges. The disabled default ports prevent an absent adapter from being mistaken for successful execution.
+
 ## Build
 
 With dependency repositories placed beside this one under `src/`:
