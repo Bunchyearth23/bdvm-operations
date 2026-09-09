@@ -16,7 +16,12 @@ internal static class Program
         StrictGeneratorActivationRollsBack();
         StrictGeneratorActivationPreservesExistingJobs();
         StrictGeneratorActivationFailsClosedOnMigrationMutation();
+        StrictGeneratorActivationRejectsGenerationRace();
         StrictGeneratorActivationContainsAdapterExceptions();
+        CompetingContractsCannotReserveTheSameWagon();
+        WagonTypeAndCapacityFailuresAreAtomic();
+        PartialCancellationAndRetryConserveState();
+        PendingTransferCanBeRetriedWithoutDuplicateAccounting();
         Console.WriteLine("W-038 offline checks passed: " + checks);
     }
 
@@ -122,6 +127,66 @@ internal static class Program
         Check(!report.Applied && report.ResultCode == "strict-generator-suspension-failed:broken" && !vanilla.Suppressed, "strict activation contains adapter exceptions and rolls back prior controls");
     }
 
+    private static void StrictGeneratorActivationRejectsGenerationRace()
+    {
+        var vanilla = new Generator("vanilla", true, "open-job") { AddJobWhenSuppressed = "racing-job" };
+        var report = IndustrialRuntimeGate.TryEnableStrictWithReport("strict", new[] { vanilla });
+        Check(!report.Applied && report.ResultCode == "strict-new-jobs-generated:vanilla" && !vanilla.Suppressed,
+            "strict activation detects a generation race and rolls back instead of accepting a free consist");
+    }
+
+    private static void CompetingContractsCannotReserveTheSameWagon()
+    {
+        var state = State("w038-wagon-contention", 0); Stocks(state, 20m, 0m, 20m);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p")); var engine = Engine(state);
+        var first = engine.CreateTransportOffer("first", "ORIGIN", "DEST", "Logs", 10m, AccountRef.Player("p"), 10, 0, 0, 100, Requirement(10m), 0);
+        var second = engine.CreateTransportOffer("second", "ORIGIN", "DEST", "Logs", 10m, AccountRef.Player("p"), 10, 0, 0, 100, Requirement(10m), 0);
+        engine.Accept("accept-first", first.ContractId, first.Version, 0, 10, null);
+        engine.AssignWagons("assign-first", "p", first.ContractId, first.Version, AssetOwnerRef.Player("p"), new[] { wagon.AssetId });
+        engine.Accept("accept-second", second.ContractId, second.Version, 0, 10, null);
+        var refused = false; try { engine.AssignWagons("assign-second", "p", second.ContractId, second.Version, AssetOwnerRef.Player("p"), new[] { wagon.AssetId }); } catch (InvalidOperationException) { refused = true; }
+        Check(refused && second.AssignedWagons.Count == 0 && state.Fleet.Single().OperationalState == FleetOperationalState.Reserved,
+            "two contracts cannot claim one wagon and a refused assignment does not mutate either contract");
+    }
+
+    private static void WagonTypeAndCapacityFailuresAreAtomic()
+    {
+        var state = State("w038-compatibility", 0); Stocks(state, 10m, 0m, 20m);
+        var wrong = AddWagon(state, "wagon.tank", AssetOwnerRef.Player("p"));
+        var small = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        var engine = Engine(state); var contract = engine.CreateTransportOffer("freight", "ORIGIN", "DEST", "Logs", 10m, AccountRef.Player("p"), 10, 0, 0, 100, Requirement(20m), 0);
+        engine.Accept("accept", contract.ContractId, contract.Version, 0, 10, null);
+        var wrongRefused = false; try { engine.AssignWagons("wrong", "p", contract.ContractId, contract.Version, AssetOwnerRef.Player("p"), new[] { wrong.AssetId }); } catch (InvalidOperationException) { wrongRefused = true; }
+        var capacityRefused = false; try { engine.AssignWagons("small", "p", contract.ContractId, contract.Version, AssetOwnerRef.Player("p"), new[] { small.AssetId }); } catch (InvalidOperationException) { capacityRefused = true; }
+        Check(wrongRefused && capacityRefused && contract.AssignedWagons.Count == 0 && state.Fleet.All(x => x.OperationalState == FleetOperationalState.Available),
+            "wrong cargo type and insufficient capacity fail atomically without reserving rolling stock");
+    }
+
+    private static void PartialCancellationAndRetryConserveState()
+    {
+        var state = State("w038-partial-cancel", 0); Stocks(state, 10m, 0m, 20m);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p")); var engine = Engine(state);
+        var contract = engine.CreateTransportOffer("freight", "ORIGIN", "DEST", "Logs", 10m, AccountRef.Player("p"), 100, 0, 0, 100, Requirement(10m), 0);
+        engine.Accept("accept", contract.ContractId, contract.Version, 0, 10, null); engine.AssignWagons("assign", "p", contract.ContractId, contract.Version, AssetOwnerRef.Player("p"), new[] { wagon.AssetId }); engine.Activate("activate", contract.ContractId, 1);
+        engine.RecordLoading("load", contract.ContractId, wagon.AssetId, 6m); engine.RecordUnloading("unload", contract.ContractId, wagon.AssetId, 4m);
+        var cancelled = engine.Cancel("cancel", contract.ContractId); var replay = engine.Cancel("cancel", contract.ContractId);
+        Check(ReferenceEquals(cancelled, replay) && cancelled.State == IndustrialContractState.Cancelled && cancelled.PaidAmount == 40 && state.Fleet.Single().OperationalState == FleetOperationalState.Available,
+            "partial delivery cancellation is idempotent, retains earned payment and releases the operator wagon");
+        Check(state.IndustrialStocks.Single(x => x.FacilityId == "ORIGIN").ReservedOutbound == 0m && state.IndustrialStocks.Single(x => x.FacilityId == "DEST").ReservedInbound == 0m,
+            "partial cancellation releases only the remaining cargo reservations");
+    }
+
+    private static void PendingTransferCanBeRetriedWithoutDuplicateAccounting()
+    {
+        var state = State("w038-transfer-retry", 0); Stocks(state, 10m, 0m, 20m);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p")); var transfers = new RetryTransfers(); var engine = new IndustrialEconomyEngine(state, new Host(), new LegacyExecution(), transfers, new Compatibility());
+        var contract = engine.CreateTransportOffer("freight", "ORIGIN", "DEST", "Logs", 10m, AccountRef.Player("p"), 100, 0, 0, 100, Requirement(10m), 0);
+        engine.Accept("accept", contract.ContractId, contract.Version, 0, 10, null); engine.AssignWagons("assign", "p", contract.ContractId, contract.Version, AssetOwnerRef.Player("p"), new[] { wagon.AssetId }); engine.Activate("activate", contract.ContractId, 1);
+        var pending = engine.RecordLoading("load", contract.ContractId, wagon.AssetId, 10m); var completedLoad = engine.RecordLoading("load", contract.ContractId, wagon.AssetId, 10m);
+        Check(pending == completedLoad && completedLoad.State == IndustrialContractState.Active && completedLoad.Manifests.Single().LoadedQuantity == 10m && state.IndustrialStocks.Single(x => x.FacilityId == "ORIGIN").OnHand == 0m,
+            "an unknown load observation remains pending and the same operation can be retried exactly once");
+    }
+
     private static VehicleAcquisitionSnapshot State(string checkpoint, long balance)
     {
         var economy = new CompanyEconomySnapshot { CheckpointId = checkpoint };
@@ -151,13 +216,14 @@ internal static class Program
     private sealed class Host : INetworkRoleDetector { public NetworkRoleReport Detect() => new NetworkRoleReport { Role = NetworkRole.MultiplayerHost, HasAuthority = true, Detail = "test host" }; }
     private sealed class LegacyExecution : IIndustrialExecutionPort { public bool Available => true; public WorldOwnershipOutcome InspectDelivery(string operationId, string contractId, decimal cumulativeQuantity) => WorldOwnershipOutcome.Applied; }
     private sealed class Transfers : ICargoTransferObservationPort { public WorldOwnershipOutcome InspectLoading(string operationId, string contractId, string assetId, decimal cumulativeQuantity) => WorldOwnershipOutcome.Applied; public WorldOwnershipOutcome InspectUnloading(string operationId, string contractId, string assetId, decimal cumulativeQuantity) => WorldOwnershipOutcome.Applied; }
+    private sealed class RetryTransfers : ICargoTransferObservationPort { private int loads; public WorldOwnershipOutcome InspectLoading(string operationId, string contractId, string assetId, decimal cumulativeQuantity) => ++loads == 1 ? WorldOwnershipOutcome.Unknown : WorldOwnershipOutcome.Applied; public WorldOwnershipOutcome InspectUnloading(string operationId, string contractId, string assetId, decimal cumulativeQuantity) => WorldOwnershipOutcome.Applied; }
     private sealed class Compatibility : IWagonCompatibilityPort { public WagonCompatibility Inspect(string assetId, string definitionId, string cargoId) => new WagonCompatibility { Compatible = definitionId == "wagon.box" && cargoId == "Logs", Capacity = 10m, Detail = "test" }; }
     private sealed class Generator : ITransportGeneratorAdapter
     {
         private readonly bool succeeds; public Generator(string id, bool succeeds, params string[] jobs) { GeneratorId = id; this.succeeds = succeeds; Jobs.AddRange(jobs); }
         public string GeneratorId { get; } public bool CanSuppressNewConsists => true; public bool Suppressed { get; private set; } public int Calls { get; private set; }
-        public List<string> Jobs { get; } = new List<string>(); public bool RemoveJobsWhenSuppressed { get; set; } public bool ThrowWhenSetting { get; set; }
-        public bool TrySetNewConsistsSuppressed(string operationId, bool suppressed) { Calls++; if (ThrowWhenSetting) throw new InvalidOperationException("test adapter failure"); if (!succeeds) return false; Suppressed = suppressed; if (suppressed && RemoveJobsWhenSuppressed) Jobs.Clear(); return true; }
+        public List<string> Jobs { get; } = new List<string>(); public bool RemoveJobsWhenSuppressed { get; set; } public bool ThrowWhenSetting { get; set; } public string? AddJobWhenSuppressed { get; set; }
+        public bool TrySetNewConsistsSuppressed(string operationId, bool suppressed) { Calls++; if (ThrowWhenSetting) throw new InvalidOperationException("test adapter failure"); if (!succeeds) return false; Suppressed = suppressed; if (suppressed && RemoveJobsWhenSuppressed) Jobs.Clear(); if (suppressed && !string.IsNullOrWhiteSpace(AddJobWhenSuppressed)) Jobs.Add(AddJobWhenSuppressed!); return true; }
         public IReadOnlyList<string> ReadExistingOpenJobIds() => Jobs.ToArray();
     }
 }

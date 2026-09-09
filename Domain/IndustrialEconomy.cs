@@ -181,6 +181,11 @@ public static class IndustrialRuntimeGate
                     RollBack(operationId, changed);
                     return Report(false, "strict-existing-jobs-mutated:" + controls[index].GeneratorId, Array.Empty<string>());
                 }
+                else if (after[index].Except(before[index], StringComparer.Ordinal).Any())
+                {
+                    RollBack(operationId, changed);
+                    return Report(false, "strict-new-jobs-generated:" + controls[index].GeneratorId, Array.Empty<string>());
+                }
             return Report(true, "strict-generator-control-active", before.SelectMany(x => x).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToArray());
         }
         catch
