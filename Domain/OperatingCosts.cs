@@ -7,6 +7,7 @@ namespace BDVM.Domain;
 
 public enum OperatingCostState { Open, Settled, Rejected }
 public enum ExternalSettlementState { NotRequired, Pending, Applied, Conflict }
+public enum OperatingCostSettlementMode { PersonalExternalWallet, SharedExternalWallet }
 
 [DataContract]
 public sealed class OperatingCostRecord
@@ -30,6 +31,8 @@ public sealed class OperatingCostRecord
     [DataMember(Name = "externalSettlement", Order = 17)] public ExternalSettlementState ExternalSettlement { get; set; }
     [DataMember(Name = "reservedAmount", Order = 18)] public long ReservedAmount { get; set; }
     [DataMember(Name = "reservationReleased", Order = 19)] public bool ReservationReleased { get; set; }
+    [DataMember(Name = "settlementMode", Order = 20)] public OperatingCostSettlementMode SettlementMode { get; set; }
+    [DataMember(Name = "subsidizedExcess", Order = 21)] public long SubsidizedExcess { get; set; }
 }
 
 public sealed class OperatingCostEngine
@@ -45,14 +48,16 @@ public sealed class OperatingCostEngine
         VehicleAcquisitionPersistence.Validate(state);
     }
 
-    public OperatingCostRecord Begin(ManualMaintenanceRequest request, long vanillaBalanceBefore, decimal conditionBefore, string? tripId = null)
+    public OperatingCostRecord Begin(ManualMaintenanceRequest request, long vanillaBalanceBefore, decimal conditionBefore, string? tripId = null,
+        OperatingCostSettlementMode settlementMode = OperatingCostSettlementMode.PersonalExternalWallet)
     {
         lock (gate)
         {
             if (!NetworkAuthorityPolicy.CanExecuteEconomy(authority.Detect(), out _)) throw new InvalidOperationException("Host authority is required.");
             if (!ManualMaintenancePolicy.Validate(request, out var reason)) throw new InvalidOperationException(reason);
             if (vanillaBalanceBefore < 0 || conditionBefore < 0m || conditionBefore > 1m) throw new ArgumentOutOfRangeException(nameof(vanillaBalanceBefore));
-            var fingerprint = string.Join("|", request.RequesterId, request.AssetId, request.Action, request.Payer!.Key, request.MaximumAuthorizedCost, vanillaBalanceBefore, conditionBefore, tripId ?? "");
+            if (!Enum.IsDefined(typeof(OperatingCostSettlementMode), settlementMode)) throw new ArgumentOutOfRangeException(nameof(settlementMode));
+            var fingerprint = string.Join("|", request.RequesterId, request.AssetId, request.Action, request.Payer!.Key, request.MaximumAuthorizedCost, vanillaBalanceBefore, conditionBefore, tripId ?? "", settlementMode);
             var known = state.OperatingCosts.SingleOrDefault(x => x.SessionId == request.CommandId);
             if (known != null)
             {
@@ -67,10 +72,10 @@ public sealed class OperatingCostEngine
             if (!CanOperate(player, operatingOwner)) throw new InvalidOperationException("The requester cannot maintain this asset.");
             AuthorizePayer(player, operatingOwner, request.Payer);
             var personal = state.Economy.Wallets.Single(x => x.Account.Key == AccountRef.Player(player.PlayerId).Key);
-            if (personal.Balance != vanillaBalanceBefore) throw new InvalidOperationException("The personal wallet must be synchronized before opening a cost session.");
+            if (settlementMode == OperatingCostSettlementMode.PersonalExternalWallet && personal.Balance != vanillaBalanceBefore) throw new InvalidOperationException("The personal wallet must be synchronized before opening a cost session.");
             var payer = state.Economy.Wallets.Single(x => x.Account.Key == request.Payer.Key);
-            var reservation = request.Payer.Kind == AccountKind.Company ? request.MaximumAuthorizedCost : 0;
-            if (payer.Balance < reservation) throw new InvalidOperationException("The company payer cannot reserve the maximum authorized cost.");
+            var reservation = request.Payer.Kind == AccountKind.Company || settlementMode == OperatingCostSettlementMode.SharedExternalWallet ? request.MaximumAuthorizedCost : 0;
+            if (payer.Balance < reservation) throw new InvalidOperationException("The selected payer cannot reserve the maximum authorized cost.");
             if (reservation > 0) { payer.Balance -= reservation; payer.Version++; }
             var record = new OperatingCostRecord
             {
@@ -79,7 +84,7 @@ public sealed class OperatingCostEngine
                 VanillaBalanceBefore = vanillaBalanceBefore, VanillaBalanceAfter = vanillaBalanceBefore,
                 ConditionBefore = conditionBefore, ConditionAfter = conditionBefore, TripId = string.IsNullOrWhiteSpace(tripId) ? null : tripId,
                 State = OperatingCostState.Open, ResultCode = "manual-session-open", ExternalSettlement = ExternalSettlementState.NotRequired,
-                ReservedAmount = reservation, ReservationReleased = reservation == 0
+                ReservedAmount = reservation, ReservationReleased = reservation == 0, SettlementMode = settlementMode
             };
             state.OperatingCosts.Add(record);
             return record;
@@ -96,10 +101,22 @@ public sealed class OperatingCostEngine
             if (vanillaBalanceAfter < 0 || vanillaBalanceAfter > record.VanillaBalanceBefore) return RejectAndRelease(record, "ambiguous-vanilla-balance-change");
             if (conditionAfter < 0m || conditionAfter > 1m) return RejectAndRelease(record, "invalid-condition", vanillaBalanceAfter, conditionAfter);
             var cost = record.VanillaBalanceBefore - vanillaBalanceAfter;
-            if (cost > record.MaximumAuthorizedCost) return RejectAndRelease(record, "authorized-cost-exceeded", vanillaBalanceAfter, conditionAfter);
+            if (cost > record.MaximumAuthorizedCost)
+            {
+                if (record.SettlementMode == OperatingCostSettlementMode.SharedExternalWallet)
+                    return RecoverSharedAuthorizedCostExceeded(record, cost, vanillaBalanceAfter, conditionAfter);
+                return RejectAndRelease(record, "authorized-cost-exceeded", vanillaBalanceAfter, conditionAfter);
+            }
             var personal = state.Economy.Wallets.Single(x => x.Account.Key == AccountRef.Player(record.RequesterId).Key);
-            if (personal.Balance != record.VanillaBalanceBefore) return RejectAndRelease(record, "wallet-version-context-changed");
-            if (record.Payer.Kind == AccountKind.Player)
+            if (record.SettlementMode == OperatingCostSettlementMode.SharedExternalWallet)
+            {
+                if (record.ReservedAmount < cost) return RejectAndRelease(record, "invalid-payer-reservation", vanillaBalanceAfter, conditionAfter);
+                ReleaseReservation(record, cost);
+                record.ExternalReimbursement = cost;
+                record.ExternalSettlement = cost == 0 ? ExternalSettlementState.NotRequired : ExternalSettlementState.Pending;
+            }
+            else if (personal.Balance != record.VanillaBalanceBefore) return RejectAndRelease(record, "wallet-version-context-changed");
+            else if (record.Payer.Kind == AccountKind.Player)
             {
                 personal.Balance = vanillaBalanceAfter; personal.Version++;
             }
@@ -131,7 +148,9 @@ public sealed class OperatingCostEngine
             if (record.ExternalSettlement == ExternalSettlementState.Applied || record.ExternalSettlement == ExternalSettlementState.NotRequired) return record;
             var expected = checked(record.VanillaBalanceAfter + record.ExternalReimbursement);
             record.ExternalSettlement = observedVanillaBalance == expected ? ExternalSettlementState.Applied : ExternalSettlementState.Conflict;
-            record.ResultCode = record.ExternalSettlement == ExternalSettlementState.Applied ? "operating-cost-settled" : "external-wallet-conflict";
+            if (record.ExternalSettlement == ExternalSettlementState.Applied)
+                record.ResultCode = record.State == OperatingCostState.Rejected ? "authorized-cost-exceeded-reimbursed" : "operating-cost-settled";
+            else record.ResultCode = "external-wallet-conflict";
             return record;
         }
     }
@@ -181,12 +200,33 @@ public sealed class OperatingCostEngine
             record.VanillaBalanceAfter = observedVanillaBalance.Value;
             record.ActualCost = record.VanillaBalanceBefore - observedVanillaBalance.Value;
             var personal = state.Economy.Wallets.Single(x => x.Account.Key == AccountRef.Player(record.RequesterId).Key);
-            if (personal.Balance == record.VanillaBalanceBefore) { personal.Balance = observedVanillaBalance.Value; personal.Version++; }
+            if (record.SettlementMode == OperatingCostSettlementMode.PersonalExternalWallet && personal.Balance == record.VanillaBalanceBefore) { personal.Balance = observedVanillaBalance.Value; personal.Version++; }
         }
         if (conditionAfter.HasValue && conditionAfter.Value >= 0m && conditionAfter.Value <= 1m) record.ConditionAfter = conditionAfter.Value;
         ReleaseReservation(record, 0);
         record.State = OperatingCostState.Rejected;
         record.ResultCode = code;
+        return record;
+    }
+
+    private OperatingCostRecord RecoverSharedAuthorizedCostExceeded(OperatingCostRecord record, long observedCost, long vanillaBalanceAfter, decimal conditionAfter)
+    {
+        var chargedCost = Math.Min(record.ReservedAmount, record.MaximumAuthorizedCost);
+        ReleaseReservation(record, chargedCost);
+        record.VanillaBalanceAfter = vanillaBalanceAfter;
+        record.ActualCost = observedCost;
+        record.ConditionAfter = conditionAfter;
+        record.ExternalReimbursement = observedCost;
+        record.ExternalSettlement = observedCost == 0 ? ExternalSettlementState.NotRequired : ExternalSettlementState.Pending;
+        record.SubsidizedExcess = observedCost - chargedCost;
+        record.State = OperatingCostState.Rejected;
+        record.ResultCode = "authorized-cost-exceeded";
+        var entryId = record.SessionId + ":cost";
+        if (chargedCost > 0 && !state.Economy.Ledger.Any(x => x.EntryId == entryId)) state.Economy.Ledger.Add(new LedgerEntry
+        {
+            EntryId = entryId, CommandId = record.SessionId, Kind = LedgerEntryKind.OperatingCost, Debit = record.Payer, Amount = chargedCost,
+            Detail = "asset=" + record.AssetId + ";action=" + record.Action + ";externalCost=" + observedCost + ";authorizedCharge=" + chargedCost + ";subsidizedExcess=" + record.SubsidizedExcess + ";source=shared-wallet-overrun-recovery"
+        });
         return record;
     }
 

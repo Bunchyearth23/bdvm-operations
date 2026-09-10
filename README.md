@@ -16,7 +16,7 @@
 
 - Reserve, activate, complete or cancel freight and passenger mission assignments.
 - Keep mission completion behind a port so a game adapter can validate the real-world result.
-- Model persistent station inventories, bounded production backlogs, preparation reservations and versioned transport contracts.
+- Model persistent station inventories, bounded production backlogs, shortage-driven transport needs, preparation reservations and versioned transport contracts.
 - Require compatible rolling stock owned or actively leased by the operator; contracts never supply or replace wagons.
 - Reconcile partial loading and unloading through per-wagon manifests and idempotency keys, then pay cumulative recognized delivery exactly once.
 - Prevent competing generators from producing contradictory jobs or free rolling stock when an integration can control them.
@@ -28,7 +28,9 @@
 
 The main services are `MissionAssignmentEngine`, `IndustrialEconomyEngine`, `OperatingCostEngine` and `TriageAssistanceEngine`. Integration points include `IMissionCompletionPort`, `IIndustrialExecutionPort`, `ICargoTransferObservationPort`, `IWagonCompatibilityPort`, `ITransportGeneratorAdapter` and `ITriageLogisticsPort`.
 
-`TransportContract` schema 2 contains cargo, quantity, origin, destination, deadline, reward and wagon requirements. `AssignedWagons` records an operator choice after acceptance; it is not supplied equipment. Acceptance reserves source cargo and destination capacity for a bounded preparation window. Expiry or cancellation releases those reservations idempotently. Loading removes only observed cargo from source stock; unloading credits destination stock and reward only for the observed delta.
+`IndustrialTransportPolicy` publishes a need only when the source has unreserved cargo, the destination has free capacity and its target stock is short. Offer lifetime, preparation lifetime and delivery deadline are independent persisted values. Accepting one version of a need reserves source cargo and destination capacity atomically; a competing or stale acceptance fails.
+
+`IndustrialContract` contains cargo, quantity, origin, destination, deadline, reward and wagon requirements. `AssignedWagons` records an operator choice after acceptance; it is not supplied equipment. The host computes compatible choices from available freight wagons owned by, or actively leased to, the operator. Loading moves only physically observed cargo into an in-transit reservation. Unloading credits destination stock and reward only for the observed delta. Cancellation releases unhandled reservations and restores still-onboard abstract cargo to the source exactly once.
 
 ## Boundaries
 
@@ -52,7 +54,7 @@ Build `BDVM.Full` to compile the domain into the current game runtime.
 
 ## Testing and installation
 
-Domain validation covers assignment lifecycles, industrial stock conservation, generator gates, cost settlement and refusal of autonomous driving. A standalone Unity Mod Manager package is not published yet; use the matching `BDVM.Full` composition.
+Domain validation covers assignment lifecycles, industrial stock conservation, competing need acceptance, owned/leased wagon discovery, partial manifests, cancellation with in-transit cargo, generator gates, cost settlement and refusal of autonomous driving. A standalone Unity Mod Manager package is not published yet; use the matching `BDVM.Full` composition.
 
 ## Compatibility
 
