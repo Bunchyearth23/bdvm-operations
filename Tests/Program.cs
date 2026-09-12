@@ -14,6 +14,8 @@ internal static class Program
         StationShortagePublishesPersistentTransportNeeds();
         TransportNeedExpiryAndCompetingAcceptanceFailClosed();
         TransportNeedRequiresRealStockCapacityAndShortage();
+        SourceAndSinkRecipesKeepTheIndustrialGraphLive();
+        NeedPricesExposeStockPressureCostsAndPossibleLosses();
         OperatorWagonsAndManifestsSurviveReload();
         AggregateDeliveryCannotBypassPhysicalManifests();
         LeasedWagonExpiryAndMissingWagonFailClosed();
@@ -28,6 +30,11 @@ internal static class Program
         CompatibleWagonQueryIsAuthoritativeAndLeaseAware();
         PartialCancellationAndRetryConserveState();
         PendingTransferCanBeRetriedWithoutDuplicateAccounting();
+        LiveStockTransportHasNoOfferOrCargoReservation();
+        CargoTagsPersistAndExpireByChosenLifetime();
+        PreloadedTaggedCargoJoinsTransportWithoutDoubleStockDebit();
+        DispatchCargoTagsAreGuarded();
+        TimedProductionRunsFullToEightyThenSlowsToFullStop();
         Console.WriteLine("W-038 offline checks passed: " + checks);
     }
 
@@ -64,6 +71,43 @@ internal static class Program
         catch (InvalidOperationException) { reservedMutationRefused = true; }
         Check(ReferenceEquals(input, replay) && ReferenceEquals(recipe, recipeReplay) && reservedMutationRefused && state.IndustrialCommands.Count == 5,
             "stock and recipe configuration is idempotent and cannot rewrite cargo reserved by a contract");
+    }
+
+    private static void LiveStockTransportHasNoOfferOrCargoReservation()
+    {
+        var state = State("w038-live-stock", 0); Stocks(state, 20m, 0m, 20m);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        Tag(state, wagon, CargoTagLifetime.Permanent);
+        var engine = Engine(state);
+        engine.ConfigureTransportPolicy("live-policy", "logs-live", "ORIGIN", "DEST", "Logs", 10m, 20m, 100, 100,
+            10, 10, 0, Requirement(10m), true, 100, 150);
+        var firstQuote = engine.CurrentTransportNeed("logs-live", 1) ?? throw new InvalidOperationException("Expected live stock projection.");
+        var movement = engine.StartStockTransport("live-start", "p", "logs-live", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { wagon.AssetId }, 1);
+        Check(state.IndustrialTransportNeeds.Count == 0 && state.IndustrialStocks.All(value => value.ReservedOutbound == 0m && (value.FacilityId != "DEST" || value.ReservedInbound == 0m)) && movement.StockDriven,
+            "a live stock movement starts without publishing an offer or reserving source/destination stock");
+        var restored = VehicleAcquisitionPersistence.Deserialize(VehicleAcquisitionPersistence.Serialize(state), "w038-live-stock");
+        Check(restored.IndustrialContracts.Single().StockDriven && restored.IndustrialContracts.Single().TransportPolicyId == "logs-live" && restored.IndustrialContracts.Single().AssignedWagons.Single().AssetId == wagon.AssetId,
+            "the chosen stock movement and exact operator wagon survive save and reload");
+        engine.Activate("live-activate", movement.ContractId, 1);
+        engine.RecordLoading("live-load", movement.ContractId, wagon.AssetId, 10m, 1);
+        Check(state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").OnHand == 10m && state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").ReservedInbound == 10m,
+            "only observed physical loading removes stock and records cargo in transit");
+        state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand = 10m;
+        var lowerQuote = engine.CurrentTransportNeed("logs-live", 2) ?? throw new InvalidOperationException("Expected remaining live demand.");
+        engine.RecordUnloading("live-unload", movement.ContractId, wagon.AssetId, 10m, 2);
+        Check(movement.State == IndustrialContractState.Completed && movement.PaidAmount > 0 && movement.PaidAmount < firstQuote.BaseReward + firstQuote.ScarcityBonus &&
+              lowerQuote.EstimatedNetMargin < firstQuote.EstimatedNetMargin && state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand == 20m,
+            "delivery pays from current stock pressure and can earn less than the earlier estimate");
+
+        var race = State("w038-live-race", 0); Stocks(race, 10m, 0m, 30m); var firstWagon = AddWagon(race, "wagon.box", AssetOwnerRef.Player("p")); var secondWagon = AddWagon(race, "wagon.box", AssetOwnerRef.Player("p")); Tag(race, firstWagon, CargoTagLifetime.Permanent); Tag(race, secondWagon, CargoTagLifetime.Permanent); var raceEngine = Engine(race);
+        raceEngine.ConfigureTransportPolicy("race-policy", "race", "ORIGIN", "DEST", "Logs", 10m, 30m, 100, 0, 10, 10, 0, Requirement(10m), true, 100, 10);
+        var firstMovement = raceEngine.StartStockTransport("race-first", "p", "race", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { firstWagon.AssetId }, 1);
+        var secondMovement = raceEngine.StartStockTransport("race-second", "p", "race", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { secondWagon.AssetId }, 1);
+        raceEngine.Activate("race-first-active", firstMovement.ContractId, 1); raceEngine.Activate("race-second-active", secondMovement.ContractId, 1); raceEngine.RecordLoading("race-first-load", firstMovement.ContractId, firstWagon.AssetId, 10m, 1);
+        var staleLoadRefused = false; try { raceEngine.RecordLoading("race-second-load", secondMovement.ContractId, secondWagon.AssetId, 10m, 1); } catch (InvalidOperationException) { staleLoadRefused = true; }
+        raceEngine.Cancel("race-second-cancel", secondMovement.ContractId);
+        Check(staleLoadRefused && secondMovement.State == IndustrialContractState.Cancelled && race.Fleet.Single(value => value.AssetId == secondWagon.AssetId).OperationalState == FleetOperationalState.Available,
+            "competing movements recheck stock at physical loading and the losing movement can be cancelled without deadlock");
     }
 
     private static void StationShortagePublishesPersistentTransportNeeds()
@@ -120,6 +164,89 @@ internal static class Program
         Check(engine.PublishTransportNeed("publish-empty", noSource.PolicyId, 1) == null && engine.PublishTransportNeed("publish-full", noShortage.PolicyId, 1) == null && state.IndustrialTransportNeeds.Count == 0,
             "stations publish no transport need without source stock, destination capacity and a real target shortage");
         Check(state.Assets.Assets.Count == assets && state.Fleet.Count == 0, "transport-need publication never creates rolling stock");
+    }
+
+    private static void SourceAndSinkRecipesKeepTheIndustrialGraphLive()
+    {
+        var state = State("w038-source-sink", 0);
+        state.IndustrialStocks.Add(new IndustrialStock { FacilityId = "MINE", CargoId = "IronOre", OnHand = 0m, Capacity = 40m, Version = 1 });
+        state.IndustrialStocks.Add(new IndustrialStock { FacilityId = "PORT", CargoId = "IronOre", OnHand = 30m, Capacity = 40m, Version = 1 });
+        var engine = Engine(state);
+        var source = engine.ConfigureRecipe("source-config", "iron-mine", "MINE", "", 0m, "IronOre", 10m, 5, 4);
+        var sink = engine.ConfigureRecipe("sink-config", "iron-export", "PORT", "IronOre", 10m, "", 0m, 5, 4);
+        var sourceCycles = engine.AdvanceProduction("source-tick", source.RecipeId, 20);
+        var sinkCycles = engine.AdvanceProduction("sink-tick", sink.RecipeId, 20);
+        var restored = VehicleAcquisitionPersistence.Deserialize(VehicleAcquisitionPersistence.Serialize(state), state.CheckpointId);
+        Check(sourceCycles == 4 && sinkCycles == 3 && restored.IndustrialStocks.Single(x => x.FacilityId == "MINE").OnHand == 40m && restored.IndustrialStocks.Single(x => x.FacilityId == "PORT").OnHand == 0m,
+            "input-free sources replenish bounded stock while output-free sinks release destination capacity without inventing transportable cargo");
+        Check(restored.IndustrialRecipes.Count == 2 && restored.IndustrialRecipes.All(x => x.CompletedCycles > 0),
+            "source and sink recipes remain valid and persistent across reload");
+    }
+
+    private static void NeedPricesExposeStockPressureCostsAndPossibleLosses()
+    {
+        var state = State("w038-dynamic-need-price", 0);
+        Stocks(state, 100m, 0m, 100m);
+        var engine = Engine(state);
+        var policy = engine.ConfigureTransportPolicy("price-policy", "priced-flow", "ORIGIN", "DEST", "Logs", 20m, 50m, 1000, 200, 100, 20, 0, Requirement(20m), true, 100, 1500);
+        var need = engine.PublishTransportNeed("price-publish", policy.PolicyId, 1) ?? throw new InvalidOperationException("Expected priced need.");
+        var later = engine.CurrentTransportNeed(policy.PolicyId, 80) ?? throw new InvalidOperationException("Expected later priced need.");
+        Check(need.PriceFactor >= 0.55m && need.PriceFactor <= 1.45m && later.PriceFactor >= 0.55m && later.PriceFactor <= 1.45m && later.PriceFactor != need.PriceFactor,
+            "market value is bounded and continues to move with authoritative time even without a cargo movement");
+        var costly = engine.ConfigureTransportPolicy("loss-policy", "loss-flow", "ORIGIN", "DEST", "Logs", 10m, 50m, 500, 0, 100, 20, 0, Requirement(10m), true, 100, 2000);
+        var loss = engine.PublishTransportNeed("loss-publish", costly.PolicyId, 2) ?? throw new InvalidOperationException("Expected loss-making need.");
+        Check(loss.EstimatedNetMargin < 0, "a coherent but poor equipment/cost choice can be visibly loss-making");
+    }
+
+    private static void CargoTagsPersistAndExpireByChosenLifetime()
+    {
+        var state = State("w038-cargo-tags", 0); Stocks(state, 30m, 0m, 30m);
+        var oneShot = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        var untilEmpty = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        var untagged = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        Tag(state, oneShot, CargoTagLifetime.NextLoading);
+        var engine = Engine(state);
+        engine.ConfigureTransportPolicy("tag-policy", "tag-flow", "ORIGIN", "DEST", "Logs", 10m, 30m, 100, 0, 10, 10, 0, Requirement(10m), true, 100, 0);
+        var untaggedRefused = false; try { engine.StartStockTransport("tag-missing", "p", "tag-flow", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { untagged.AssetId }, 1); } catch (InvalidOperationException) { untaggedRefused = true; }
+        Check(untaggedRefused && state.IndustrialContracts.Count == 0 && state.IndustrialCargoTags.All(value => value.AssetId != untagged.AssetId), "a dossier cannot create a missing wagon tag implicitly");
+        var first = engine.StartStockTransport("tag-once", "p", "tag-flow", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { oneShot.AssetId }, 1);
+        engine.Activate("tag-once-active", first.ContractId, 1); engine.RecordLoading("tag-once-load", first.ContractId, oneShot.AssetId, 10m, 1);
+        Check(state.IndustrialCargoTags.All(value => value.AssetId != oneShot.AssetId), "one-shot wagon cargo tag clears after the first observed loading");
+        RollingStockTags.SetCargo(state, "p", untilEmpty.AssetId, state.Fleet.Single(value => value.AssetId == untilEmpty.AssetId).Version, "ORIGIN", "Logs", CargoTagLifetime.UntilEmpty, true, new Compatibility(), (facility, cargo) => facility == "ORIGIN" && cargo == "Logs");
+        var second = engine.StartStockTransport("tag-empty", "p", "tag-flow", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { untilEmpty.AssetId }, 2);
+        Check(state.IndustrialCargoTags.Single(value => value.AssetId == untilEmpty.AssetId).Lifetime == CargoTagLifetime.UntilEmpty, "dossier preserves the independently selected wagon tag duration");
+        engine.Activate("tag-empty-active", second.ContractId, 2); engine.RecordLoading("tag-empty-load", second.ContractId, untilEmpty.AssetId, 10m, 2);
+        Check(state.IndustrialCargoTags.Single(value => value.AssetId == untilEmpty.AssetId).Lifetime == CargoTagLifetime.UntilEmpty, "until-empty cargo tag survives loading and save state");
+        engine.RecordUnloading("tag-empty-unload", second.ContractId, untilEmpty.AssetId, 10m, 2);
+        Check(state.IndustrialCargoTags.All(value => value.AssetId != untilEmpty.AssetId), "until-empty wagon cargo tag clears only after complete physical unloading");
+    }
+
+    private static void PreloadedTaggedCargoJoinsTransportWithoutDoubleStockDebit()
+    {
+        var state = State("w038-preloaded-tagged-cargo", 0); Stocks(state, 10m, 0m, 30m);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p")); Tag(state, wagon, CargoTagLifetime.UntilEmpty);
+        var engine = Engine(state);
+        engine.ConfigureTransportPolicy("preloaded-policy", "preloaded-flow", "ORIGIN", "DEST", "Logs", 10m, 30m, 100, 0, 10, 10, 0, Requirement(10m), true, 100, 0);
+        var contract = engine.StartStockTransport("preloaded-start", "p", "preloaded-flow", 10m, AccountRef.Player("p"), AssetOwnerRef.Player("p"), new[] { wagon.AssetId }, 1,
+            new Dictionary<string, decimal> { [wagon.AssetId] = 10m });
+        Check(state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").OnHand == 10m && contract.Manifests.Single().OnBoardQuantity == 10m,
+            "a dossier adopts cargo already loaded by its valid tag without debiting source stock twice");
+        engine.Activate("preloaded-active", contract.ContractId, 1);
+        engine.RecordUnloading("preloaded-unload", contract.ContractId, wagon.AssetId, 10m, 1);
+        Check(contract.State == IndustrialContractState.Completed && state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand == 10m,
+            "preloaded tagged cargo can complete and pay through the normal transport manifest");
+    }
+
+    private static void TimedProductionRunsFullToEightyThenSlowsToFullStop()
+    {
+        var state = State("w038-production-curve", 0);
+        state.IndustrialStocks.Add(new IndustrialStock { FacilityId = "MINE", CargoId = "Ore", OnHand = 80m, Capacity = 100m, Version = 1 });
+        var engine = Engine(state); var recipe = engine.ConfigureRecipe("curve-recipe", "mine", "MINE", "", 0m, "Ore", 5m, 1, 20);
+        var slowed = engine.AdvanceProduction("curve-advance", recipe.RecipeId, 4);
+        Check(slowed > 0 && slowed < 4 && state.IndustrialStocks.Single().OnHand < 100m, "timed production runs below full speed after output reaches eighty percent");
+        state.IndustrialStocks.Single().OnHand = 100m;
+        var stopped = engine.AdvanceProduction("curve-stop", recipe.RecipeId, 24);
+        Check(stopped == 0 && state.IndustrialStocks.Single().OnHand == 100m, "timed production stops at one hundred percent output stock");
     }
 
     private static void OperatorWagonsAndManifestsSurviveReload()
@@ -180,9 +307,10 @@ internal static class Program
         var blockedReplay = engine.AdvanceProduction("tick-30", "mill", 300);
         var restored = VehicleAcquisitionPersistence.Deserialize(VehicleAcquisitionPersistence.Serialize(state), state.CheckpointId);
         restored.IndustrialStocks.Single(x => x.CargoId == "Lumber").OnHand = 0m;
-        var resumed = Engine(restored).AdvanceProduction("tick-30-resume", "mill", 30);
+        var sameTick = Engine(restored).AdvanceProduction("tick-30-resume", "mill", 30);
+        var resumed = Engine(restored).AdvanceProduction("tick-60-resume", "mill", 60);
         var recipe = restored.IndustrialRecipes.Single();
-        Check(blocked == 0 && blockedReplay == 0 && resumed == 2 && recipe.PendingCycles == 1 && recipe.CompletedCycles == 2, "output saturation applies backpressure and resumes persisted bounded backlog after delivery without re-advancing a retried command clock");
+        Check(blocked == 0 && blockedReplay == 0 && sameTick == 0 && resumed == 2 && recipe.PendingCycles == 0 && recipe.CompletedCycles == 2, "output saturation stops production without banking a catch-up burst, then resumes only as new clock intervals elapse");
     }
 
     private static void LeasedWagonExpiryAndMissingWagonFailClosed()
@@ -314,6 +442,45 @@ internal static class Program
             "an unknown load observation remains pending and the same operation can be retried exactly once");
     }
 
+    private static void DispatchCargoTagsAreGuarded()
+    {
+        var state = State("dispatch-tags", 0);
+        var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
+        var fleet = state.Fleet.Single();
+        void Set(string cargo, bool empty = true, long? version = null, string actor = "p", CargoTagLifetime lifetime = CargoTagLifetime.Permanent)
+            => RollingStockTags.SetCargo(state, actor, wagon.AssetId, version ?? fleet.Version, cargo.Length == 0 ? "" : "ORIGIN", cargo, lifetime, empty, new Compatibility(), (facility, providedCargo) => facility == "ORIGIN" && providedCargo == "Logs");
+        void Refuses(Action action, string label)
+        {
+            var before = VehicleAcquisitionPersistence.Serialize(state); var refused = false;
+            try { action(); } catch (InvalidOperationException) { refused = true; } catch (UnauthorizedAccessException) { refused = true; } catch (ArgumentException) { refused = true; }
+            Check(refused && before == VehicleAcquisitionPersistence.Serialize(state), label);
+        }
+        var initialVersion = fleet.Version;
+        Set("Logs");
+        Check(state.IndustrialCargoTags.Single().CargoId == "Logs" && fleet.Version > initialVersion, "dispatch assigns compatible cargo independently of a dossier");
+        Refuses(() => Set("Logs", version: initialVersion), "stale browser tag update is rejected without mutation");
+        Refuses(() => Set("Coal"), "incompatible cargo tag is refused atomically");
+        Refuses(() => RollingStockTags.SetCargo(state, "p", wagon.AssetId, fleet.Version, "DEST", "Logs", CargoTagLifetime.UntilEmpty, true, new Compatibility(), (facility, cargo) => facility == "ORIGIN" && cargo == "Logs"), "cargo not supplied by the selected industry is refused atomically");
+        Refuses(() => Set("", false), "loaded wagon tag cannot be removed");
+        Refuses(() => Set("Logs", lifetime: (CargoTagLifetime)99), "undefined cargo tag duration is rejected");
+        new CompanyEconomyEngine(state.Economy).EnsurePlayer("other", 0);
+        Refuses(() => Set("Logs", actor: "other"), "another player cannot tag owned stock");
+        fleet.OperationalState = FleetOperationalState.Stored;
+        Refuses(() => Set("Logs"), "stored stock cannot receive cargo assignment");
+        fleet.OperationalState = FleetOperationalState.Maintenance;
+        Refuses(() => Set("Logs"), "maintenance stock cannot receive cargo assignment");
+        Set("");
+        Check(state.IndustrialCargoTags.Count == 0, "an empty stored or maintenance wagon can clear its cargo tag");
+        fleet.OperationalState = FleetOperationalState.Available;
+        Set("Logs");
+        var restored = VehicleAcquisitionPersistence.Deserialize(VehicleAcquisitionPersistence.Serialize(state), "dispatch-tags");
+        Check(restored.IndustrialCargoTags.Single().Lifetime == CargoTagLifetime.Permanent && restored.IndustrialCargoTags.Single().SourceFacilityId == "ORIGIN", "standalone dispatch tag and source industry persist across reload");
+        state.IndustrialContracts.Add(new IndustrialContract { ContractId = "active", State = IndustrialContractState.Active, AssignedWagons = new List<ContractWagonAssignment> { new ContractWagonAssignment { AssetId = wagon.AssetId } } });
+        var locked = false; var versionBefore = fleet.Version;
+        try { Set("Logs"); } catch (InvalidOperationException) { locked = true; }
+        Check(locked && fleet.Version == versionBefore, "an active dossier locks standalone tag edits even if fleet state is available");
+    }
+
     private static VehicleAcquisitionSnapshot State(string checkpoint, long balance)
     {
         var economy = new CompanyEconomySnapshot { CheckpointId = checkpoint };
@@ -337,6 +504,7 @@ internal static class Program
     }
 
     private static WagonRequirement Requirement(decimal capacity) => new WagonRequirement { CargoId = "Logs", MinimumWagonCount = 1, MinimumTotalCapacity = capacity, AllowedDefinitionIds = new List<string> { "wagon.box" } };
+    private static void Tag(VehicleAcquisitionSnapshot state, FleetAsset wagon, CargoTagLifetime lifetime) => state.IndustrialCargoTags.Add(new IndustrialCargoTag { AssetId = wagon.AssetId, SourceFacilityId = "ORIGIN", CargoId = "Logs", Lifetime = lifetime });
     private static IndustrialEconomyEngine Engine(VehicleAcquisitionSnapshot state) => new IndustrialEconomyEngine(state, new Host(), new LegacyExecution(), new Transfers(), new Compatibility());
     private static void Check(bool condition, string message) { checks++; if (!condition) throw new InvalidOperationException("FAIL: " + message); }
 

@@ -7,6 +7,18 @@ namespace BDVM.Domain;
 
 public enum IndustrialContractState { Offered, Reserved, Active, Completed, Cancelled, DeliveryPending, Expired }
 public enum IndustrialNeedState { Available, Accepted, Expired }
+public enum CargoTagLifetime { NextLoading, UntilEmpty, Permanent }
+
+[DataContract]
+public sealed class IndustrialCargoTag
+{
+    [DataMember(Name = "assetId", Order = 1)] public string AssetId { get; set; } = "";
+    [DataMember(Name = "cargoId", Order = 2)] public string CargoId { get; set; } = "";
+    [DataMember(Name = "lifetime", Order = 3)] public CargoTagLifetime Lifetime { get; set; } = CargoTagLifetime.UntilEmpty;
+    [DataMember(Name = "dossierId", Order = 4)] public string? DossierId { get; set; }
+    [DataMember(Name = "version", Order = 5)] public long Version { get; set; } = 1;
+    [DataMember(Name = "sourceFacilityId", Order = 6)] public string SourceFacilityId { get; set; } = "";
+}
 
 [DataContract]
 public sealed class IndustrialStock
@@ -18,6 +30,9 @@ public sealed class IndustrialStock
     [DataMember(Name = "reservedOutbound", Order = 5)] public decimal ReservedOutbound { get; set; }
     [DataMember(Name = "reservedInbound", Order = 6)] public decimal ReservedInbound { get; set; }
     [DataMember(Name = "version", Order = 7)] public long Version { get; set; }
+    [DataMember(Name = "currentUnitValue", Order = 8)] public long CurrentUnitValue { get; set; }
+    [DataMember(Name = "previousUnitValue", Order = 9)] public long PreviousUnitValue { get; set; }
+    [DataMember(Name = "lastMarketTick", Order = 10)] public long LastMarketTick { get; set; }
     public string Key => FacilityId + ":" + CargoId;
 }
 
@@ -36,6 +51,7 @@ public sealed class IndustrialRecipe
     [DataMember(Name = "pendingCycles", Order = 10)] public int PendingCycles { get; set; }
     [DataMember(Name = "maximumBacklogCycles", Order = 11)] public int MaximumBacklogCycles { get; set; } = 128;
     [DataMember(Name = "completedCycles", Order = 12)] public long CompletedCycles { get; set; }
+    [DataMember(Name = "productionThrottleAccumulator", Order = 13)] public decimal ProductionThrottleAccumulator { get; set; }
 }
 
 [DataContract]
@@ -57,6 +73,7 @@ public sealed class IndustrialTransportPolicy
     [DataMember(Name = "enabled", Order = 14)] public bool Enabled { get; set; } = true;
     [DataMember(Name = "version", Order = 15)] public long Version { get; set; } = 1;
     [DataMember(Name = "deliveryDurationTicks", Order = 16)] public long DeliveryDurationTicks { get; set; }
+    [DataMember(Name = "estimatedOperatingCost", Order = 17)] public long EstimatedOperatingCost { get; set; }
 }
 
 [DataContract]
@@ -80,6 +97,11 @@ public sealed class IndustrialTransportNeed
     [DataMember(Name = "publishedCommandId", Order = 16)] public string PublishedCommandId { get; set; } = "";
     [DataMember(Name = "version", Order = 17)] public long Version { get; set; } = 1;
     [DataMember(Name = "deliveryDurationTicks", Order = 18)] public long DeliveryDurationTicks { get; set; }
+    [DataMember(Name = "estimatedOperatingCost", Order = 19)] public long EstimatedOperatingCost { get; set; }
+    [DataMember(Name = "estimatedNetMargin", Order = 20)] public long EstimatedNetMargin { get; set; }
+    [DataMember(Name = "sourceFillRatio", Order = 21)] public decimal SourceFillRatio { get; set; }
+    [DataMember(Name = "destinationFillRatio", Order = 22)] public decimal DestinationFillRatio { get; set; }
+    [DataMember(Name = "priceFactor", Order = 23)] public decimal PriceFactor { get; set; } = 1m;
 }
 
 [DataContract]
@@ -144,6 +166,11 @@ public class TransportContract
     [DataMember(Name = "manifests", Order = 23)] public List<CargoManifest> Manifests { get; set; } = new List<CargoManifest>();
     [DataMember(Name = "reservationsReleased", Order = 24)] public bool ReservationsReleased { get; set; }
     [DataMember(Name = "penaltyApplied", Order = 25)] public long PenaltyApplied { get; set; }
+    [DataMember(Name = "stockDriven", Order = 26)] public bool StockDriven { get; set; }
+    [DataMember(Name = "transportPolicyId", Order = 27)] public string? TransportPolicyId { get; set; }
+    [DataMember(Name = "estimatedOperatingCost", Order = 28)] public long EstimatedOperatingCost { get; set; }
+    [DataMember(Name = "quotedUnitValue", Order = 29)] public long QuotedUnitValue { get; set; }
+    [DataMember(Name = "cargoTagLifetime", Order = 30)] public CargoTagLifetime CargoTagLifetime { get; set; } = CargoTagLifetime.UntilEmpty;
 }
 
 [DataContract]
@@ -322,11 +349,14 @@ public sealed class IndustrialEconomyEngine
             var fingerprint = string.Join("|", "recipe", recipeId, facilityId, inputCargoId, inputQuantity, outputCargoId, outputQuantity, cadenceTicks, maximumBacklogCycles);
             var replay = Command(commandId, fingerprint);
             if (replay != null) return state.IndustrialRecipes.Single(value => value.RecipeId == recipeId);
-            if (string.IsNullOrWhiteSpace(recipeId) || string.IsNullOrWhiteSpace(facilityId) || string.IsNullOrWhiteSpace(inputCargoId) ||
-                string.IsNullOrWhiteSpace(outputCargoId) || string.Equals(inputCargoId, outputCargoId, StringComparison.Ordinal) || inputQuantity <= 0m ||
-                outputQuantity <= 0m || cadenceTicks <= 0 || maximumBacklogCycles <= 0 ||
-                !state.IndustrialStocks.Any(value => value.FacilityId == facilityId && value.CargoId == inputCargoId) ||
-                !state.IndustrialStocks.Any(value => value.FacilityId == facilityId && value.CargoId == outputCargoId))
+            var hasInput = !string.IsNullOrWhiteSpace(inputCargoId);
+            var hasOutput = !string.IsNullOrWhiteSpace(outputCargoId);
+            if (string.IsNullOrWhiteSpace(recipeId) || string.IsNullOrWhiteSpace(facilityId) || (!hasInput && !hasOutput) ||
+                (hasInput && hasOutput && string.Equals(inputCargoId, outputCargoId, StringComparison.Ordinal)) ||
+                (hasInput ? inputQuantity <= 0m : inputQuantity != 0m) || (hasOutput ? outputQuantity <= 0m : outputQuantity != 0m) ||
+                cadenceTicks <= 0 || maximumBacklogCycles <= 0 ||
+                (hasInput && !state.IndustrialStocks.Any(value => value.FacilityId == facilityId && value.CargoId == inputCargoId)) ||
+                (hasOutput && !state.IndustrialStocks.Any(value => value.FacilityId == facilityId && value.CargoId == outputCargoId)))
                 throw new ArgumentException("Invalid industrial recipe configuration.");
             var recipe = state.IndustrialRecipes.SingleOrDefault(value => value.RecipeId == recipeId);
             if (recipe == null)
@@ -349,7 +379,7 @@ public sealed class IndustrialEconomyEngine
     public IndustrialTransportPolicy ConfigureTransportPolicy(string commandId, string policyId, string originFacilityId, string destinationFacilityId,
         string cargoId, decimal batchQuantity, decimal destinationTargetQuantity, long baseReward, long maximumScarcityBonus,
         long offerLifetimeTicks, long preparationDurationTicks, long preparationPenalty, WagonRequirement wagonRequirement, bool enabled = true,
-        long deliveryDurationTicks = 0)
+        long deliveryDurationTicks = 0, long estimatedOperatingCost = 0)
     {
         lock (gate)
         {
@@ -358,12 +388,12 @@ public sealed class IndustrialEconomyEngine
             var fingerprint = string.Join("|", "transport-policy", policyId, originFacilityId, destinationFacilityId, cargoId, batchQuantity,
                 destinationTargetQuantity, baseReward, maximumScarcityBonus, offerLifetimeTicks, preparationDurationTicks, preparationPenalty,
                 wagonRequirement.MinimumWagonCount, wagonRequirement.MinimumTotalCapacity,
-                string.Join(",", wagonRequirement.AllowedDefinitionIds?.OrderBy(value => value, StringComparer.Ordinal) ?? Enumerable.Empty<string>()), enabled, deliveryDurationTicks);
+                string.Join(",", wagonRequirement.AllowedDefinitionIds?.OrderBy(value => value, StringComparer.Ordinal) ?? Enumerable.Empty<string>()), enabled, deliveryDurationTicks, estimatedOperatingCost);
             var replay = Command(commandId, fingerprint);
             if (replay != null) return state.IndustrialTransportPolicies.Single(value => value.PolicyId == policyId);
             ValidateTransportPolicy(policyId, originFacilityId, destinationFacilityId, cargoId, batchQuantity, destinationTargetQuantity,
                 baseReward, maximumScarcityBonus, offerLifetimeTicks, preparationDurationTicks, preparationPenalty, wagonRequirement,
-                deliveryDurationTicks <= 0 ? offerLifetimeTicks : deliveryDurationTicks);
+                deliveryDurationTicks <= 0 ? offerLifetimeTicks : deliveryDurationTicks, estimatedOperatingCost);
             var policy = state.IndustrialTransportPolicies.SingleOrDefault(value => value.PolicyId == policyId);
             if (policy == null)
             {
@@ -382,6 +412,7 @@ public sealed class IndustrialEconomyEngine
             policy.PreparationDurationTicks = preparationDurationTicks; policy.PreparationPenalty = preparationPenalty;
             policy.WagonRequirement = Clone(wagonRequirement)!; policy.Enabled = enabled;
             policy.DeliveryDurationTicks = deliveryDurationTicks <= 0 ? offerLifetimeTicks : deliveryDurationTicks;
+            policy.EstimatedOperatingCost = estimatedOperatingCost;
             Record(commandId, fingerprint, policyId, "transport-policy-configured");
             return policy;
         }
@@ -418,19 +449,125 @@ public sealed class IndustrialEconomyEngine
                 return null;
             }
             var scarcityRatio = policy.DestinationTargetQuantity <= 0m ? 0m : Math.Min(1m, shortage / policy.DestinationTargetQuantity);
+            var sourceFillRatio = source.Capacity <= 0m ? 0m : Math.Min(1m, available / source.Capacity);
+            var destinationFillRatio = destination.Capacity <= 0m ? 1m : Math.Min(1m, (destination.OnHand + destination.ReservedInbound) / destination.Capacity);
+            var priceFactor = MarketPriceFactor(policy, tick, scarcityRatio, sourceFillRatio);
+            var dynamicBaseReward = decimal.ToInt64(decimal.Floor(policy.BaseReward * priceFactor));
             var scarcityBonus = decimal.ToInt64(decimal.Floor(policy.MaximumScarcityBonus * scarcityRatio));
             var need = new IndustrialTransportNeed
             {
                 NeedId = policy.PolicyId + ":need:" + policy.NextNeedSequence, PolicyId = policy.PolicyId,
                 OriginFacilityId = policy.OriginFacilityId, DestinationFacilityId = policy.DestinationFacilityId, CargoId = policy.CargoId,
-                Quantity = quantity, BaseReward = policy.BaseReward, ScarcityBonus = scarcityBonus, PublishedTick = tick,
+                Quantity = quantity, BaseReward = dynamicBaseReward, ScarcityBonus = scarcityBonus, PublishedTick = tick,
                 ExpiresTick = checked(tick + policy.OfferLifetimeTicks), PreparationDurationTicks = policy.PreparationDurationTicks,
                 PreparationPenalty = policy.PreparationPenalty, WagonRequirement = Clone(policy.WagonRequirement)!, State = IndustrialNeedState.Available,
-                PublishedCommandId = commandId, Version = 1, DeliveryDurationTicks = policy.DeliveryDurationTicks
+                PublishedCommandId = commandId, Version = 1, DeliveryDurationTicks = policy.DeliveryDurationTicks,
+                EstimatedOperatingCost = policy.EstimatedOperatingCost,
+                EstimatedNetMargin = checked(dynamicBaseReward + scarcityBonus - policy.EstimatedOperatingCost),
+                SourceFillRatio = sourceFillRatio, DestinationFillRatio = destinationFillRatio, PriceFactor = priceFactor
             };
             policy.NextNeedSequence++; policy.Version++; state.IndustrialTransportNeeds.Add(need);
             Record(commandId, fingerprint, need.NeedId, "transport-need-published");
             return need;
+        }
+    }
+
+    public IndustrialTransportNeed? CurrentTransportNeed(string policyId, long tick)
+    {
+        lock (gate)
+        {
+            RequireHost();
+            if (tick < 0) throw new ArgumentOutOfRangeException(nameof(tick));
+            var policy = state.IndustrialTransportPolicies.Single(value => value.PolicyId == policyId);
+            if (!policy.Enabled) return null;
+            var source = Stock(policy.OriginFacilityId, policy.CargoId);
+            var destination = Stock(policy.DestinationFacilityId, policy.CargoId);
+            var available = Math.Max(0m, source.OnHand);
+            var freeCapacity = Math.Max(0m, destination.Capacity - destination.OnHand);
+            var shortage = Math.Max(0m, policy.DestinationTargetQuantity - destination.OnHand);
+            var quantity = Math.Min(policy.BatchQuantity, Math.Min(available, Math.Min(freeCapacity, shortage)));
+            if (quantity <= 0m) return null;
+            var scarcityRatio = policy.DestinationTargetQuantity <= 0m ? 0m : Math.Min(1m, shortage / policy.DestinationTargetQuantity);
+            var sourceFillRatio = source.Capacity <= 0m ? 0m : Math.Min(1m, available / source.Capacity);
+            var destinationFillRatio = destination.Capacity <= 0m ? 1m : Math.Min(1m, destination.OnHand / destination.Capacity);
+            var priceFactor = MarketPriceFactor(policy, tick, scarcityRatio, sourceFillRatio);
+            var baseReward = decimal.ToInt64(decimal.Floor(policy.BaseReward * priceFactor));
+            var scarcityBonus = decimal.ToInt64(decimal.Floor(policy.MaximumScarcityBonus * scarcityRatio));
+            return new IndustrialTransportNeed
+            {
+                NeedId = "stock:" + policy.PolicyId, PolicyId = policy.PolicyId, OriginFacilityId = policy.OriginFacilityId,
+                DestinationFacilityId = policy.DestinationFacilityId, CargoId = policy.CargoId, Quantity = quantity,
+                BaseReward = baseReward, ScarcityBonus = scarcityBonus, PublishedTick = tick, ExpiresTick = 0,
+                PreparationDurationTicks = 0, PreparationPenalty = 0, WagonRequirement = Clone(policy.WagonRequirement)!,
+                State = IndustrialNeedState.Available, PublishedCommandId = "live-stock-projection", Version = Math.Max(policy.Version, Math.Max(source.Version, destination.Version)),
+                DeliveryDurationTicks = policy.DeliveryDurationTicks, EstimatedOperatingCost = policy.EstimatedOperatingCost,
+                EstimatedNetMargin = checked(baseReward + scarcityBonus - policy.EstimatedOperatingCost), SourceFillRatio = sourceFillRatio,
+                DestinationFillRatio = destinationFillRatio, PriceFactor = priceFactor
+            };
+        }
+    }
+
+    public IndustrialContract StartStockTransport(string commandId, string requesterId, string policyId, decimal quantity,
+        AccountRef beneficiary, AssetOwnerRef operatorRef, IReadOnlyList<string> assetIds, long tick,
+        IReadOnlyDictionary<string, decimal>? onboardQuantities = null)
+    {
+        lock (gate)
+        {
+            RequireHost();
+            var validBeneficiary = beneficiary ?? throw new ArgumentNullException(nameof(beneficiary));
+            var validOperator = operatorRef ?? throw new ArgumentNullException(nameof(operatorRef));
+            var ids = (assetIds ?? Array.Empty<string>()).Distinct(StringComparer.Ordinal).OrderBy(value => value, StringComparer.Ordinal).ToArray();
+            var onboard = onboardQuantities ?? new Dictionary<string, decimal>();
+            if (onboard.Keys.Any(id => !ids.Contains(id, StringComparer.Ordinal)) || onboard.Values.Any(value => value < 0m))
+                throw new InvalidOperationException("Preloaded cargo observations must belong to the selected wagons.");
+            var declaredOnboardTotal = onboard.Values.Sum();
+            if (declaredOnboardTotal > quantity) throw new InvalidOperationException("The planned quantity is lower than the cargo already aboard.");
+            var fingerprint = string.Join("|", "start-stock-transport", requesterId, policyId, quantity, validBeneficiary.Key, validOperator.Key, string.Join(",", ids),
+                string.Join(",", onboard.OrderBy(value => value.Key, StringComparer.Ordinal).Select(value => value.Key + "=" + value.Value)));
+            var replay = Command(commandId, fingerprint);
+            if (replay != null) return Contract(replay.AssignmentId);
+            var need = CurrentTransportNeed(policyId, tick) ?? throw new InvalidOperationException("No stock-driven transport is currently required.");
+            var selectedTags = ids.Select(id => state.IndustrialCargoTags.SingleOrDefault(tag => tag.AssetId == id)
+                ?? throw new InvalidOperationException("Every selected wagon must have a cargo tag. Assign it in Dispatch first.")).ToArray();
+            if (selectedTags.Any(tag => tag.CargoId != need.CargoId)) throw new InvalidOperationException("A selected wagon has a different cargo tag. Change its tag in Dispatch first.");
+            if (selectedTags.Any(tag => tag.SourceFacilityId != need.OriginFacilityId)) throw new InvalidOperationException("A selected wagon is tagged for another industry. Change its tag in Dispatch first.");
+            if (quantity <= 0m || quantity > need.Quantity) throw new InvalidOperationException("Requested quantity exceeds current source stock or destination need.");
+            var ratio = quantity / need.Quantity;
+            var requirement = Clone(need.WagonRequirement)!;
+            requirement.MinimumTotalCapacity = quantity;
+            var contract = CreateTransportOffer("stock-transport:" + commandId, need.OriginFacilityId, need.DestinationFacilityId, need.CargoId, quantity,
+                validBeneficiary, decimal.ToInt64(decimal.Floor(need.BaseReward * ratio)), decimal.ToInt64(decimal.Floor(need.ScarcityBonus * ratio)), tick,
+                need.DeliveryDurationTicks <= 0 ? 0 : checked(tick + need.DeliveryDurationTicks), requirement, 0);
+            contract.StockDriven = true; contract.TransportPolicyId = policyId; contract.EstimatedOperatingCost = decimal.ToInt64(decimal.Floor(need.EstimatedOperatingCost * ratio));
+            contract.QuotedUnitValue = quantity <= 0m ? 0 : decimal.ToInt64(decimal.Floor((contract.BaseReward + contract.ScarcityBonus) / quantity));
+            contract.CargoTagLifetime = selectedTags.FirstOrDefault()?.Lifetime ?? CargoTagLifetime.UntilEmpty;
+            contract.State = IndustrialContractState.Reserved; contract.PreparationExpiresTick = 0; contract.Version++;
+            contract = AssignWagons(commandId + ":wagons", requesterId, contract.ContractId, contract.Version, validOperator, ids, tick);
+            var onboardTotal = 0m;
+            foreach (var manifest in contract.Manifests)
+            {
+                if (!onboard.TryGetValue(manifest.AssetId, out var loaded) || loaded <= 0m) continue;
+                var capacity = contract.AssignedWagons.Single(value => value.AssetId == manifest.AssetId).Capacity;
+                if (loaded > capacity) throw new InvalidOperationException("Preloaded cargo exceeds the assigned wagon capacity.");
+                manifest.LoadedQuantity = loaded;
+                onboardTotal += loaded;
+            }
+            if (onboardTotal > quantity) throw new InvalidOperationException("The planned quantity is lower than the cargo already aboard.");
+            if (onboardTotal > 0m)
+            {
+                var source = Stock(contract.OriginFacilityId, contract.CargoId);
+                if (source.OnHand + source.ReservedInbound + onboardTotal > source.Capacity)
+                    throw new InvalidOperationException("The source cannot reserve return capacity for the cargo already aboard.");
+                source.ReservedInbound += onboardTotal;
+                source.Version++;
+            }
+            foreach (var id in ids)
+            {
+                var tag = state.IndustrialCargoTags.Single(value => value.AssetId == id);
+                tag.DossierId = contract.ContractId; tag.Version++;
+            }
+            Record(commandId, fingerprint, contract.ContractId, "stock-transport-started");
+            return contract;
         }
     }
 
@@ -592,8 +729,11 @@ public sealed class IndustrialEconomyEngine
                 if (contract.State != IndustrialContractState.DeliveryPending) { contract.State = IndustrialContractState.DeliveryPending; contract.Version++; }
                 return contract;
             }
-            var delta = cumulative - manifest.LoadedQuantity; if (delta > 0m) { var source = Stock(contract.OriginFacilityId, contract.CargoId); if (source.OnHand < delta || source.ReservedOutbound < delta || contract.Manifests.Sum(x => x.LoadedQuantity) + delta > contract.Quantity) throw new InvalidOperationException("Source reservation conflicts with observed loading."); source.OnHand -= delta; source.ReservedOutbound -= delta; source.ReservedInbound += delta; source.Version++; manifest.LoadedQuantity = cumulative; }
-            manifest.LoadOperationIds.Add(operationId); replay!.ResultCode = "ok"; contract.State = IndustrialContractState.Active; contract.Version++; return contract;
+            var delta = cumulative - manifest.LoadedQuantity; if (delta > 0m) { var source = Stock(contract.OriginFacilityId, contract.CargoId); if (source.OnHand < delta || (!contract.StockDriven && source.ReservedOutbound < delta) || contract.Manifests.Sum(x => x.LoadedQuantity) + delta > contract.Quantity) throw new InvalidOperationException(contract.StockDriven ? "Current source stock is insufficient for observed loading." : "Source reservation conflicts with observed loading."); source.OnHand -= delta; if (!contract.StockDriven) source.ReservedOutbound -= delta; source.ReservedInbound += delta; source.Version++; manifest.LoadedQuantity = cumulative; }
+            manifest.LoadOperationIds.Add(operationId); replay!.ResultCode = "ok"; contract.State = IndustrialContractState.Active; contract.Version++;
+            var loadedTag = state.IndustrialCargoTags.SingleOrDefault(value => value.AssetId == assetId);
+            if (loadedTag?.Lifetime == CargoTagLifetime.NextLoading) state.IndustrialCargoTags.Remove(loadedTag);
+            return contract;
         }
     }
 
@@ -620,9 +760,12 @@ public sealed class IndustrialEconomyEngine
                 if (contract.State != IndustrialContractState.DeliveryPending) { contract.State = IndustrialContractState.DeliveryPending; contract.Version++; }
                 return contract;
             }
-            var delta = cumulative - manifest.UnloadedQuantity; if (delta > 0m) { var source = Stock(contract.OriginFacilityId, contract.CargoId); var destination = Stock(contract.DestinationFacilityId, contract.CargoId); if (source.ReservedInbound < delta || destination.ReservedInbound < delta || destination.OnHand + delta > destination.Capacity) throw new InvalidOperationException("Destination reservation conflicts with observed unloading."); source.ReservedInbound -= delta; source.Version++; destination.OnHand += delta; destination.ReservedInbound -= delta; destination.Version++; manifest.UnloadedQuantity = cumulative; contract.DeliveredQuantity += delta; Pay(contract, operationId, delta); }
+            var delta = cumulative - manifest.UnloadedQuantity; if (delta > 0m) { var source = Stock(contract.OriginFacilityId, contract.CargoId); var destination = Stock(contract.DestinationFacilityId, contract.CargoId); if (source.ReservedInbound < delta || (!contract.StockDriven && destination.ReservedInbound < delta) || destination.OnHand + delta > destination.Capacity) throw new InvalidOperationException(contract.StockDriven ? "Current destination stock has no capacity for observed unloading." : "Destination reservation conflicts with observed unloading."); var payment = contract.StockDriven ? PaymentForDelivery(contract, delta, authoritativeTick) : LegacyPayment(contract, contract.DeliveredQuantity + delta); source.ReservedInbound -= delta; source.Version++; destination.OnHand += delta; if (!contract.StockDriven) destination.ReservedInbound -= delta; destination.Version++; manifest.UnloadedQuantity = cumulative; contract.DeliveredQuantity += delta; Pay(contract, operationId, delta, payment); }
             manifest.UnloadOperationIds.Add(operationId); contract.DeliveryOperationIds.Add(operationId); replay!.ResultCode = "ok"; contract.State = contract.DeliveredQuantity == contract.Quantity ? IndustrialContractState.Completed : IndustrialContractState.Active;
-            if (contract.State == IndustrialContractState.Completed) { contract.ReservationsReleased = true; ReleaseWagons(contract); } contract.Version++; return contract;
+            if (contract.State == IndustrialContractState.Completed) { contract.ReservationsReleased = true; ReleaseWagons(contract); }
+            var unloadedTag = state.IndustrialCargoTags.SingleOrDefault(value => value.AssetId == assetId);
+            if (unloadedTag?.Lifetime == CargoTagLifetime.UntilEmpty && manifest.OnBoardQuantity <= 0m) state.IndustrialCargoTags.Remove(unloadedTag);
+            contract.Version++; return contract;
         }
     }
 
@@ -673,22 +816,71 @@ public sealed class IndustrialEconomyEngine
         {
             RequireHost(); var fingerprint = "advance|" + recipeId; var replay = Command(commandId, fingerprint); if (replay != null) return int.Parse(replay.ResultCode); var recipe = state.IndustrialRecipes.Single(x => x.RecipeId == recipeId);
             if (tick < recipe.LastProductionTick || recipe.CadenceTicks <= 0 || recipe.MaximumBacklogCycles <= 0) throw new InvalidOperationException("Invalid production clock.");
-            var due = (tick - recipe.LastProductionTick) / recipe.CadenceTicks; if (due > 0) { recipe.PendingCycles = Math.Min(recipe.MaximumBacklogCycles, checked(recipe.PendingCycles + (int)Math.Min(due, int.MaxValue))); recipe.LastProductionTick = checked(recipe.LastProductionTick + due * recipe.CadenceTicks); }
-            var completed = ExecuteCycles(recipe, recipe.PendingCycles); recipe.PendingCycles -= completed; recipe.Version++; Record(commandId, fingerprint, recipeId, completed.ToString()); return completed;
+            var due = (tick - recipe.LastProductionTick) / recipe.CadenceTicks;
+            if (due <= 0) { Record(commandId, fingerprint, recipeId, "0"); return 0; }
+            var opportunities = (int)Math.Min(due, recipe.MaximumBacklogCycles);
+            recipe.LastProductionTick = checked(recipe.LastProductionTick + due * recipe.CadenceTicks);
+            var completed = ExecuteTimedCycles(recipe, opportunities);
+            recipe.PendingCycles = 0;
+            recipe.Version++; Record(commandId, fingerprint, recipeId, completed.ToString()); return completed;
         }
+    }
+
+    private int ExecuteTimedCycles(IndustrialRecipe recipe, int opportunities)
+    {
+        var input = string.IsNullOrWhiteSpace(recipe.InputCargoId) ? null : Stock(recipe.FacilityId, recipe.InputCargoId);
+        var output = string.IsNullOrWhiteSpace(recipe.OutputCargoId) ? null : Stock(recipe.FacilityId, recipe.OutputCargoId);
+        var completed = 0;
+        for (var attempt = 0; attempt < opportunities; attempt++)
+        {
+            if (input != null && input.OnHand - input.ReservedOutbound < recipe.InputQuantity) break;
+            if (output != null && output.Capacity - output.OnHand - output.ReservedInbound < recipe.OutputQuantity) break;
+            var fill = output == null || output.Capacity <= 0m ? 0m : Math.Min(1m, output.OnHand / output.Capacity);
+            var rate = fill <= 0.80m ? 1m : Math.Max(0m, (1m - fill) / 0.20m);
+            recipe.ProductionThrottleAccumulator += rate;
+            if (recipe.ProductionThrottleAccumulator < 1m) continue;
+            recipe.ProductionThrottleAccumulator -= 1m;
+            if (input != null) input.OnHand -= recipe.InputQuantity;
+            if (output != null) output.OnHand += recipe.OutputQuantity;
+            completed++;
+        }
+        if (completed > 0)
+        {
+            if (input != null) input.Version++;
+            if (output != null) output.Version++;
+            recipe.CompletedCycles = checked(recipe.CompletedCycles + completed);
+        }
+        return completed;
     }
 
     private int ExecuteCycles(IndustrialRecipe recipe, int max)
     {
-        var input = Stock(recipe.FacilityId, recipe.InputCargoId); var output = Stock(recipe.FacilityId, recipe.OutputCargoId); var cycles = 0;
-        while (cycles < max && input.OnHand - input.ReservedOutbound >= recipe.InputQuantity && output.Capacity - output.OnHand - output.ReservedInbound >= recipe.OutputQuantity) { input.OnHand -= recipe.InputQuantity; output.OnHand += recipe.OutputQuantity; cycles++; }
-        if (cycles > 0) { input.Version++; output.Version++; recipe.CompletedCycles = checked(recipe.CompletedCycles + cycles); } return cycles;
+        var input = string.IsNullOrWhiteSpace(recipe.InputCargoId) ? null : Stock(recipe.FacilityId, recipe.InputCargoId);
+        var output = string.IsNullOrWhiteSpace(recipe.OutputCargoId) ? null : Stock(recipe.FacilityId, recipe.OutputCargoId);
+        var cycles = 0;
+        while (cycles < max && (input == null || input.OnHand - input.ReservedOutbound >= recipe.InputQuantity) &&
+               (output == null || output.Capacity - output.OnHand - output.ReservedInbound >= recipe.OutputQuantity))
+        { if (input != null) input.OnHand -= recipe.InputQuantity; if (output != null) output.OnHand += recipe.OutputQuantity; cycles++; }
+        if (cycles > 0) { if (input != null) input.Version++; if (output != null) output.Version++; recipe.CompletedCycles = checked(recipe.CompletedCycles + cycles); } return cycles;
     }
 
     private void Reserve(IndustrialContract c) { var source = Stock(c.OriginFacilityId, c.CargoId); var destination = Stock(c.DestinationFacilityId, c.CargoId); if (source.OnHand - source.ReservedOutbound < c.Quantity) throw new InvalidOperationException("Industrial source stock is insufficient."); if (destination.Capacity - destination.OnHand - destination.ReservedInbound < c.Quantity) throw new InvalidOperationException("Industrial destination capacity is insufficient."); source.ReservedOutbound += c.Quantity; source.Version++; destination.ReservedInbound += c.Quantity; destination.Version++; }
-    private void ReleaseReservations(IndustrialContract c) { if (c.ReservationsReleased || c.State == IndustrialContractState.Offered) return; var loaded = c.Manifests.Sum(x => x.LoadedQuantity); var onBoard = c.Manifests.Sum(x => Math.Max(0m, x.LoadedQuantity - x.UnloadedQuantity)); var source = Stock(c.OriginFacilityId, c.CargoId); var destination = Stock(c.DestinationFacilityId, c.CargoId); source.ReservedOutbound -= Math.Min(source.ReservedOutbound, Math.Max(0m, c.Quantity - loaded)); if (source.ReservedInbound < onBoard) throw new InvalidOperationException("In-transit return capacity reservation is missing."); source.ReservedInbound -= onBoard; source.OnHand += onBoard; if (source.OnHand > source.Capacity) throw new InvalidOperationException("Cancelled in-transit cargo cannot be restored within source capacity."); source.Version++; destination.ReservedInbound -= Math.Min(destination.ReservedInbound, Math.Max(0m, c.Quantity - c.DeliveredQuantity)); destination.Version++; c.ReservationsReleased = true; }
-    private void ReleaseWagons(IndustrialContract c) { foreach (var wagon in c.AssignedWagons) { var fleet = state.Fleet.SingleOrDefault(x => x.AssetId == wagon.AssetId); if (fleet != null && (fleet.OperationalState == FleetOperationalState.Reserved || fleet.OperationalState == FleetOperationalState.InService)) { fleet.OperationalState = FleetOperationalState.Available; fleet.Version++; } } }
-    private void Pay(IndustrialContract c, string operationId, decimal delta) { var total = checked(c.BaseReward + c.ScarcityBonus); var cumulative = decimal.ToInt64(decimal.Floor(total * c.DeliveredQuantity / c.Quantity)); var payment = cumulative - c.PaidAmount; if (payment <= 0) return; var wallet = state.Economy.Wallets.Single(x => x.Account.Key == c.Beneficiary.Key); wallet.Balance = checked(wallet.Balance + payment); wallet.Version++; state.Economy.Ledger.Add(new LedgerEntry { EntryId = c.ContractId + ":delivery:" + operationId, CommandId = operationId, Kind = LedgerEntryKind.IndustrialRevenue, Credit = Clone(c.Beneficiary), Amount = payment, Detail = "transport-delivery;contract=" + c.ContractId + ";delta=" + delta + ";cumulative=" + c.DeliveredQuantity }); c.PaidAmount += payment; }
+    private void ReleaseReservations(IndustrialContract c) { if (c.ReservationsReleased || c.State == IndustrialContractState.Offered) return; var loaded = c.Manifests.Sum(x => x.LoadedQuantity); var onBoard = c.Manifests.Sum(x => Math.Max(0m, x.LoadedQuantity - x.UnloadedQuantity)); var source = Stock(c.OriginFacilityId, c.CargoId); var destination = Stock(c.DestinationFacilityId, c.CargoId); if (!c.StockDriven) source.ReservedOutbound -= Math.Min(source.ReservedOutbound, Math.Max(0m, c.Quantity - loaded)); if (source.ReservedInbound < onBoard) throw new InvalidOperationException("In-transit return capacity reservation is missing."); source.ReservedInbound -= onBoard; source.OnHand += onBoard; if (source.OnHand > source.Capacity) throw new InvalidOperationException("Cancelled in-transit cargo cannot be restored within source capacity."); source.Version++; if (!c.StockDriven) { destination.ReservedInbound -= Math.Min(destination.ReservedInbound, Math.Max(0m, c.Quantity - c.DeliveredQuantity)); destination.Version++; } c.ReservationsReleased = true; }
+    private void ReleaseWagons(IndustrialContract c) { foreach (var wagon in c.AssignedWagons) { var fleet = state.Fleet.SingleOrDefault(x => x.AssetId == wagon.AssetId); if (fleet != null && (fleet.OperationalState == FleetOperationalState.Reserved || fleet.OperationalState == FleetOperationalState.InService)) { fleet.OperationalState = FleetOperationalState.Available; fleet.Version++; } var tag = state.IndustrialCargoTags.SingleOrDefault(x => x.AssetId == wagon.AssetId && x.DossierId == c.ContractId); if (tag != null) { tag.DossierId = null; tag.Version++; } } }
+    private long LegacyPayment(IndustrialContract c, decimal cumulativeQuantity) { var total = checked(c.BaseReward + c.ScarcityBonus); var cumulative = decimal.ToInt64(decimal.Floor(total * cumulativeQuantity / c.Quantity)); return Math.Max(0, cumulative - c.PaidAmount); }
+    private long PaymentForDelivery(IndustrialContract c, decimal delta, long? tick = null) { if (!c.StockDriven || string.IsNullOrWhiteSpace(c.TransportPolicyId)) return LegacyPayment(c, c.DeliveredQuantity); var quote = CurrentTransportNeed(c.TransportPolicyId!, tick ?? state.LeaseClock.ActiveTick); if (quote == null) return 0; return decimal.ToInt64(decimal.Floor((quote.BaseReward + quote.ScarcityBonus) * delta / quote.Quantity)); }
+    private void Pay(IndustrialContract c, string operationId, decimal delta, long? calculatedPayment = null) { var payment = calculatedPayment ?? PaymentForDelivery(c, delta); if (payment <= 0) return; var wallet = state.Economy.Wallets.Single(x => x.Account.Key == c.Beneficiary.Key); wallet.Balance = checked(wallet.Balance + payment); wallet.Version++; state.Economy.Ledger.Add(new LedgerEntry { EntryId = c.ContractId + ":delivery:" + operationId, CommandId = operationId, Kind = LedgerEntryKind.IndustrialRevenue, Credit = Clone(c.Beneficiary), Amount = payment, Detail = "stock-driven-transport-delivery;contract=" + c.ContractId + ";delta=" + delta + ";cumulative=" + c.DeliveredQuantity }); c.PaidAmount += payment; }
+    private static decimal MarketPriceFactor(IndustrialTransportPolicy policy, long tick, decimal scarcityRatio, decimal sourceFillRatio)
+    {
+        // Deterministic host-clock movement keeps saves/replays identical while prices continue
+        // changing even when no player moves cargo. Each cargo is phase shifted independently.
+        var phase = (policy.CargoId ?? "").Aggregate(17, (value, character) => unchecked(value * 31 + character)) & 0x7fffffff;
+        phase %= 240;
+        var position = (tick + phase) % 240;
+        var triangle = position <= 120 ? position / 120m : (240 - position) / 120m;
+        var timeMovement = (triangle - 0.5m) * 0.20m;
+        return Math.Max(0.55m, Math.Min(1.45m, 0.72m + 0.48m * scarcityRatio + 0.20m * (1m - sourceFillRatio) + timeMovement));
+    }
     private IndustrialContract Contract(string id) => state.IndustrialContracts.Single(x => x.ContractId == id);
     private IndustrialContract Active(string id) { var c = Contract(id); if (c.State != IndustrialContractState.Active && c.State != IndustrialContractState.DeliveryPending) throw new InvalidOperationException("Transport contract is not active."); return c; }
     private IndustrialStock Stock(string facility, string cargo) => state.IndustrialStocks.Single(x => x.FacilityId == facility && x.CargoId == cargo);
@@ -705,11 +897,11 @@ public sealed class IndustrialEconomyEngine
     private bool ControlsOperator(PlayerEconomicState p, AssetOwnerRef op) { if (op == null) return false; if (op.Kind == AssetOwnerKind.Player) return op.OwnerId == p.PlayerId; if (op.Kind != AssetOwnerKind.Company || p.CompanyId != op.OwnerId) return false; var c = state.Economy.Companies.SingleOrDefault(x => x.CompanyId == op.OwnerId); return c != null && !c.Liquidating && (c.LeaderId == p.PlayerId || (c.DelegatedPermissions.TryGetValue(p.PlayerId, out var rights) && rights.Contains(CompanyPermission.ManageFleet))); }
     private void ValidateTransportPolicy(string policyId, string origin, string destination, string cargo, decimal batchQuantity, decimal destinationTargetQuantity,
         long baseReward, long maximumScarcityBonus, long offerLifetimeTicks, long preparationDurationTicks, long preparationPenalty, WagonRequirement requirement,
-        long deliveryDurationTicks)
+        long deliveryDurationTicks, long estimatedOperatingCost)
     {
         if (string.IsNullOrWhiteSpace(policyId) || string.IsNullOrWhiteSpace(origin) || string.IsNullOrWhiteSpace(destination) || origin == destination ||
             string.IsNullOrWhiteSpace(cargo) || batchQuantity <= 0m || destinationTargetQuantity <= 0m || baseReward < 0 || maximumScarcityBonus < 0 ||
-            offerLifetimeTicks <= 0 || preparationDurationTicks <= 0 || deliveryDurationTicks <= 0 || preparationPenalty < 0 ||
+            offerLifetimeTicks <= 0 || preparationDurationTicks <= 0 || deliveryDurationTicks <= 0 || preparationPenalty < 0 || estimatedOperatingCost < 0 ||
             !state.IndustrialStocks.Any(value => value.FacilityId == origin && value.CargoId == cargo) ||
             !state.IndustrialStocks.Any(value => value.FacilityId == destination && value.CargoId == cargo))
             throw new ArgumentException("Invalid industrial transport policy.");
@@ -731,9 +923,11 @@ public static class IndustrialEconomyValidation
     {
         if (state.IndustrialStocks.GroupBy(x => x.Key).Any(x => x.Count() != 1) || state.IndustrialRecipes.GroupBy(x => x.RecipeId).Any(x => x.Count() != 1) || state.IndustrialContracts.GroupBy(x => x.ContractId).Any(x => x.Count() != 1) || state.IndustrialCommands.GroupBy(x => x.CommandId).Any(x => x.Count() != 1) || state.IndustrialTransportPolicies.GroupBy(x => x.PolicyId).Any(x => x.Count() != 1) || state.IndustrialTransportNeeds.GroupBy(x => x.NeedId).Any(x => x.Count() != 1)) throw new InvalidOperationException("Duplicate industrial identity.");
         foreach (var s in state.IndustrialStocks) if (string.IsNullOrWhiteSpace(s.FacilityId) || string.IsNullOrWhiteSpace(s.CargoId) || s.OnHand < 0m || s.Capacity < 0m || s.OnHand > s.Capacity || s.ReservedOutbound < 0m || s.ReservedOutbound > s.OnHand || s.ReservedInbound < 0m || s.OnHand + s.ReservedInbound > s.Capacity) throw new InvalidOperationException("Invalid industrial stock.");
-        foreach (var r in state.IndustrialRecipes) if (string.IsNullOrWhiteSpace(r.RecipeId) || r.InputQuantity <= 0m || r.OutputQuantity <= 0m || r.CadenceTicks <= 0 || r.PendingCycles < 0 || r.MaximumBacklogCycles <= 0 || r.PendingCycles > r.MaximumBacklogCycles || !state.IndustrialStocks.Any(x => x.FacilityId == r.FacilityId && x.CargoId == r.InputCargoId) || !state.IndustrialStocks.Any(x => x.FacilityId == r.FacilityId && x.CargoId == r.OutputCargoId)) throw new InvalidOperationException("Invalid industrial recipe.");
-        foreach (var p in state.IndustrialTransportPolicies) if (string.IsNullOrWhiteSpace(p.PolicyId) || string.IsNullOrWhiteSpace(p.OriginFacilityId) || string.IsNullOrWhiteSpace(p.DestinationFacilityId) || p.OriginFacilityId == p.DestinationFacilityId || string.IsNullOrWhiteSpace(p.CargoId) || p.BatchQuantity <= 0m || p.DestinationTargetQuantity <= 0m || p.BaseReward < 0 || p.MaximumScarcityBonus < 0 || p.OfferLifetimeTicks <= 0 || p.PreparationDurationTicks <= 0 || p.DeliveryDurationTicks <= 0 || p.PreparationPenalty < 0 || p.NextNeedSequence <= 0 || p.Version <= 0 || p.WagonRequirement == null || !state.IndustrialStocks.Any(x => x.FacilityId == p.OriginFacilityId && x.CargoId == p.CargoId) || !state.IndustrialStocks.Any(x => x.FacilityId == p.DestinationFacilityId && x.CargoId == p.CargoId)) throw new InvalidOperationException("Invalid industrial transport policy.");
-        foreach (var n in state.IndustrialTransportNeeds) if (string.IsNullOrWhiteSpace(n.NeedId) || string.IsNullOrWhiteSpace(n.PolicyId) || !state.IndustrialTransportPolicies.Any(p => p.PolicyId == n.PolicyId) || n.Quantity <= 0m || n.BaseReward < 0 || n.ScarcityBonus < 0 || n.PublishedTick < 0 || n.ExpiresTick <= n.PublishedTick || n.PreparationDurationTicks <= 0 || n.DeliveryDurationTicks <= 0 || n.PreparationPenalty < 0 || n.WagonRequirement == null || n.Version <= 0 || (n.State == IndustrialNeedState.Accepted && (string.IsNullOrWhiteSpace(n.AcceptedContractId) || !state.IndustrialContracts.Any(c => c.ContractId == n.AcceptedContractId)))) throw new InvalidOperationException("Invalid industrial transport need.");
-        foreach (var c in state.IndustrialContracts) { c.DeliveryOperationIds = c.DeliveryOperationIds ?? new List<string>(); c.AssignedWagons = c.AssignedWagons ?? new List<ContractWagonAssignment>(); c.Manifests = c.Manifests ?? new List<CargoManifest>(); if (c.SchemaVersion == 0) c.SchemaVersion = 1; if (string.IsNullOrWhiteSpace(c.ContractId) || c.Quantity <= 0m || c.DeliveredQuantity < 0m || c.DeliveredQuantity > c.Quantity || c.PaidAmount < 0 || c.BaseReward < 0 || c.ScarcityBonus < 0 || c.Beneficiary == null || c.AssignedWagons.GroupBy(x => x.AssetId).Any(x => x.Count() > 1) || c.Manifests.GroupBy(x => x.AssetId).Any(x => x.Count() > 1) || c.Manifests.Any(x => x.UnloadedQuantity < 0m || x.LoadedQuantity < x.UnloadedQuantity)) throw new InvalidOperationException("Invalid transport contract."); }
+        foreach (var r in state.IndustrialRecipes) { var hasInput = !string.IsNullOrWhiteSpace(r.InputCargoId); var hasOutput = !string.IsNullOrWhiteSpace(r.OutputCargoId); if (string.IsNullOrWhiteSpace(r.RecipeId) || (!hasInput && !hasOutput) || (hasInput ? r.InputQuantity <= 0m : r.InputQuantity != 0m) || (hasOutput ? r.OutputQuantity <= 0m : r.OutputQuantity != 0m) || r.CadenceTicks <= 0 || r.PendingCycles < 0 || r.MaximumBacklogCycles <= 0 || r.PendingCycles > r.MaximumBacklogCycles || r.ProductionThrottleAccumulator < 0m || r.ProductionThrottleAccumulator >= 1m || (hasInput && !state.IndustrialStocks.Any(x => x.FacilityId == r.FacilityId && x.CargoId == r.InputCargoId)) || (hasOutput && !state.IndustrialStocks.Any(x => x.FacilityId == r.FacilityId && x.CargoId == r.OutputCargoId))) throw new InvalidOperationException("Invalid industrial recipe."); }
+        foreach (var p in state.IndustrialTransportPolicies) if (string.IsNullOrWhiteSpace(p.PolicyId) || string.IsNullOrWhiteSpace(p.OriginFacilityId) || string.IsNullOrWhiteSpace(p.DestinationFacilityId) || p.OriginFacilityId == p.DestinationFacilityId || string.IsNullOrWhiteSpace(p.CargoId) || p.BatchQuantity <= 0m || p.DestinationTargetQuantity <= 0m || p.BaseReward < 0 || p.MaximumScarcityBonus < 0 || p.EstimatedOperatingCost < 0 || p.OfferLifetimeTicks <= 0 || p.PreparationDurationTicks <= 0 || p.DeliveryDurationTicks <= 0 || p.PreparationPenalty < 0 || p.NextNeedSequence <= 0 || p.Version <= 0 || p.WagonRequirement == null || !state.IndustrialStocks.Any(x => x.FacilityId == p.OriginFacilityId && x.CargoId == p.CargoId) || !state.IndustrialStocks.Any(x => x.FacilityId == p.DestinationFacilityId && x.CargoId == p.CargoId)) throw new InvalidOperationException("Invalid industrial transport policy.");
+        foreach (var n in state.IndustrialTransportNeeds) { if (n.PriceFactor == 0m) { n.PriceFactor = 1m; n.EstimatedNetMargin = n.BaseReward + n.ScarcityBonus - n.EstimatedOperatingCost; } if (string.IsNullOrWhiteSpace(n.NeedId) || string.IsNullOrWhiteSpace(n.PolicyId) || !state.IndustrialTransportPolicies.Any(p => p.PolicyId == n.PolicyId) || n.Quantity <= 0m || n.BaseReward < 0 || n.ScarcityBonus < 0 || n.EstimatedOperatingCost < 0 || n.EstimatedNetMargin != n.BaseReward + n.ScarcityBonus - n.EstimatedOperatingCost || n.SourceFillRatio < 0m || n.SourceFillRatio > 1m || n.DestinationFillRatio < 0m || n.DestinationFillRatio > 1m || n.PriceFactor < 0.5m || n.PriceFactor > 1.75m || n.PublishedTick < 0 || n.ExpiresTick <= n.PublishedTick || n.PreparationDurationTicks <= 0 || n.DeliveryDurationTicks <= 0 || n.PreparationPenalty < 0 || n.WagonRequirement == null || n.Version <= 0 || (n.State == IndustrialNeedState.Accepted && (string.IsNullOrWhiteSpace(n.AcceptedContractId) || !state.IndustrialContracts.Any(c => c.ContractId == n.AcceptedContractId)))) throw new InvalidOperationException("Invalid industrial transport need."); }
+        foreach (var c in state.IndustrialContracts) { c.DeliveryOperationIds = c.DeliveryOperationIds ?? new List<string>(); c.AssignedWagons = c.AssignedWagons ?? new List<ContractWagonAssignment>(); c.Manifests = c.Manifests ?? new List<CargoManifest>(); if (c.SchemaVersion == 0) c.SchemaVersion = 1; if (string.IsNullOrWhiteSpace(c.ContractId) || c.Quantity <= 0m || c.DeliveredQuantity < 0m || c.DeliveredQuantity > c.Quantity || c.PaidAmount < 0 || c.BaseReward < 0 || c.ScarcityBonus < 0 || c.Beneficiary == null || !Enum.IsDefined(typeof(CargoTagLifetime), c.CargoTagLifetime) || c.AssignedWagons.GroupBy(x => x.AssetId).Any(x => x.Count() > 1) || c.Manifests.GroupBy(x => x.AssetId).Any(x => x.Count() > 1) || c.Manifests.Any(x => x.UnloadedQuantity < 0m || x.LoadedQuantity < x.UnloadedQuantity)) throw new InvalidOperationException("Invalid transport contract."); }
+        foreach (var tag in state.IndustrialCargoTags) if (tag == null || string.IsNullOrWhiteSpace(tag.AssetId) || string.IsNullOrWhiteSpace(tag.CargoId) || tag.Version <= 0 || !Enum.IsDefined(typeof(CargoTagLifetime), tag.Lifetime) || !state.Assets.Assets.Any(value => value.AssetId == tag.AssetId)) throw new InvalidOperationException("Invalid industrial cargo tag.");
+        if (state.IndustrialCargoTags.GroupBy(value => value.AssetId).Any(group => group.Count() != 1)) throw new InvalidOperationException("Duplicate industrial cargo tag.");
     }
 }
