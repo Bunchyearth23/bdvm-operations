@@ -75,7 +75,7 @@ internal static class Program
 
     private static void LiveStockTransportHasNoOfferOrCargoReservation()
     {
-        var state = State("w038-live-stock", 0); Stocks(state, 20m, 0m, 20m);
+        var state = State("w038-live-stock", 0); Stocks(state, 10m, 0m, 20m);
         var wagon = AddWagon(state, "wagon.box", AssetOwnerRef.Player("p"));
         Tag(state, wagon, CargoTagLifetime.Permanent);
         var engine = Engine(state);
@@ -90,14 +90,14 @@ internal static class Program
             "the chosen stock movement and exact operator wagon survive save and reload");
         engine.Activate("live-activate", movement.ContractId, 1);
         engine.RecordLoading("live-load", movement.ContractId, wagon.AssetId, 10m, 1);
-        Check(state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").OnHand == 10m && state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").ReservedInbound == 10m,
+        Check(state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").OnHand == 0m && state.IndustrialStocks.Single(value => value.FacilityId == "ORIGIN").ReservedInbound == 10m,
             "only observed physical loading removes stock and records cargo in transit");
-        state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand = 10m;
-        var lowerQuote = engine.CurrentTransportNeed("logs-live", 2) ?? throw new InvalidOperationException("Expected remaining live demand.");
         engine.RecordUnloading("live-unload", movement.ContractId, wagon.AssetId, 10m, 2);
-        Check(movement.State == IndustrialContractState.Completed && movement.PaidAmount > 0 && movement.PaidAmount < firstQuote.BaseReward + firstQuote.ScarcityBonus &&
-              lowerQuote.EstimatedNetMargin < firstQuote.EstimatedNetMargin && state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand == 20m,
-            "delivery pays from current stock pressure and can earn less than the earlier estimate");
+        Check(movement.State == IndustrialContractState.Completed && movement.PaidAmount == firstQuote.BaseReward + firstQuote.ScarcityBonus &&
+              state.Economy.Wallets.Single().Balance == movement.PaidAmount &&
+              state.Economy.Ledger.Count(value => value.Kind == LedgerEntryKind.IndustrialRevenue) == 1 &&
+              state.IndustrialStocks.Single(value => value.FacilityId == "DEST").OnHand == 10m,
+            "delivery pays the frozen contract quote even after loading exhausts the source stock");
 
         var race = State("w038-live-race", 0); Stocks(race, 10m, 0m, 30m); var firstWagon = AddWagon(race, "wagon.box", AssetOwnerRef.Player("p")); var secondWagon = AddWagon(race, "wagon.box", AssetOwnerRef.Player("p")); Tag(race, firstWagon, CargoTagLifetime.Permanent); Tag(race, secondWagon, CargoTagLifetime.Permanent); var raceEngine = Engine(race);
         raceEngine.ConfigureTransportPolicy("race-policy", "race", "ORIGIN", "DEST", "Logs", 10m, 30m, 100, 0, 10, 10, 0, Requirement(10m), true, 100, 10);
