@@ -308,11 +308,20 @@ public sealed class IndustrialEconomyEngine
 
     public IndustrialEconomyEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IIndustrialExecutionPort execution,
         ICargoTransferObservationPort transfers, IWagonCompatibilityPort? compatibility)
+        : this(state, authority, execution, transfers, compatibility, true) { }
+
+    private IndustrialEconomyEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IIndustrialExecutionPort execution,
+        ICargoTransferObservationPort transfers, IWagonCompatibilityPort? compatibility, bool validateCompleteCareer)
     {
         this.state = state ?? throw new ArgumentNullException(nameof(state)); this.authority = authority ?? throw new ArgumentNullException(nameof(authority));
         this.execution = execution ?? throw new ArgumentNullException(nameof(execution)); this.transfers = transfers ?? throw new ArgumentNullException(nameof(transfers)); this.compatibility = compatibility;
-        VehicleAcquisitionPersistence.Validate(state);
+        if (validateCompleteCareer) VehicleAcquisitionPersistence.Validate(state);
     }
+
+    // Restricted periodic projection: only production and reservation expiry
+    // run here, with disabled physical ports and separately checked input data.
+    internal static IndustrialEconomyEngine ForPeriodicProjection(VehicleAcquisitionSnapshot projection, INetworkRoleDetector authority)
+        => new IndustrialEconomyEngine(projection, authority, new DisabledIndustrialExecutionPort(), new DisabledCargoTransferObservationPort(), null, false);
 
     public IndustrialStock ConfigureStock(string commandId, string facilityId, string cargoId, decimal onHand, decimal capacity)
     {
@@ -809,6 +818,23 @@ public sealed class IndustrialEconomyEngine
     public int RunRecipe(string commandId, string recipeId, int maximumCycles)
     {
         lock (gate) { RequireHost(); var fingerprint = "recipe|" + recipeId + "|" + maximumCycles; var replay = Command(commandId, fingerprint); if (replay != null) return int.Parse(replay.ResultCode); if (maximumCycles < 0) throw new ArgumentOutOfRangeException(nameof(maximumCycles)); var recipe = state.IndustrialRecipes.Single(x => x.RecipeId == recipeId); var cycles = ExecuteCycles(recipe, maximumCycles); Record(commandId, fingerprint, recipeId, cycles.ToString()); return cycles; }
+    }
+
+    public void AdvanceDueProduction(string commandPrefix, long tick)
+    {
+        lock (gate)
+        {
+            RequireHost();
+            foreach (var recipe in state.IndustrialRecipes.OrderBy(value => value.RecipeId))
+            {
+                if (tick < recipe.LastProductionTick || recipe.CadenceTicks <= 0 || recipe.MaximumBacklogCycles <= 0)
+                    throw new InvalidOperationException("Invalid production clock.");
+                // The automatic scheduler has no external command to acknowledge
+                // when nothing is due. Keep explicit AdvanceProduction replay intact.
+                if ((tick - recipe.LastProductionTick) / recipe.CadenceTicks > 0)
+                    AdvanceProduction(commandPrefix + ":production:" + recipe.RecipeId, recipe.RecipeId, tick);
+            }
+        }
     }
 
     public int AdvanceProduction(string commandId, string recipeId, long tick)
